@@ -1,6 +1,6 @@
 {
   "build": {
-    "buildCommand": "npm install && npx playwright install chromium --with-deps"
+    "buildCommand": "npm install && npx playwright install chromium --with-deps && npm run build"
   },
   "deploy": {
     "startCommand": "npm start"
