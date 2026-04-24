@@ -9,7 +9,8 @@
   "dependencies": {
     "@hono/node-server": "^1.19.0",
     "hono": "^4.9.0",
-    "playwright": "^1.55.0"
+    "playwright": "^1.55.0",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
