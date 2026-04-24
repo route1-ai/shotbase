@@ -7,6 +7,26 @@ const app = new Hono()
 app.get('/health', (c) => c.json({ status: 'ok', service: 'shotbase' }))
 
 app.post('/screenshot', async (c) => {
+  const authorization = c.req.header('Authorization')
+  if (!authorization) {
+    return c.json({ error: 'Missing API key' }, 401)
+  }
+
+  const match = authorization.match(/^Bearer\s+(.+)$/)
+  const apiKey = match?.[1]?.trim()
+  if (!apiKey) {
+    return c.json({ error: 'Invalid API key' }, 401)
+  }
+
+  const validKeys = (process.env.API_KEYS ?? '')
+    .split(',')
+    .map((k) => k.trim())
+    .filter(Boolean)
+
+  if (!validKeys.includes(apiKey)) {
+    return c.json({ error: 'Invalid API key' }, 401)
+  }
+
   let body: unknown
   try {
     body = await c.req.json()
