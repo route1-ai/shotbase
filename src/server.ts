@@ -188,9 +188,15 @@ app.post('/screenshot', async (c) => {
     // Extract text if needed
     let pageText: string | null = null
     if (includeText || aiExtract) {
-      pageText = await page.evaluate(() => document.body.innerText)
-      // Clean up: trim and remove excessive blank lines
-      pageText = pageText.replace(/\n\s*\n/g, '\n\n').trim()
+      try {
+        pageText = await page.evaluate(() => document.body.innerText)
+        // Clean up: trim and remove excessive blank lines
+        pageText = pageText.replace(/\n\s*\n/g, '\n\n').trim()
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error'
+        console.error('Text extraction error:', errorMsg)
+        pageText = `extraction failed: ${errorMsg}`
+      }
     }
 
     let buffer: Buffer
@@ -219,34 +225,42 @@ app.post('/screenshot', async (c) => {
     // AI Extract if requested
     let aiData: Record<string, unknown> | undefined
     if (aiExtract && bedrockClient && pageText) {
-      const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
-      const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields. For prices: array of price strings. For headings: array of main headings. For ctas: array of CTA button texts. No explanation. Just JSON.\n\nPage content:\n${pageText}\n\nRequested fields: ${JSON.stringify(fields)}`
+      try {
+        console.log(`Calling Bedrock with region: ${awsRegion}, model: anthropic.claude-3-haiku-20240307-v1:0`)
+        const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
+        const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields. For prices: array of price strings. For headings: array of main headings. For ctas: array of CTA button texts. No explanation. Just JSON.\n\nPage content:\n${pageText}\n\nRequested fields: ${JSON.stringify(fields)}`
 
-      const command = new InvokeModelCommand({
-        modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
-        contentType: 'application/json',
-        accept: 'application/json',
-        body: JSON.stringify({
-          anthropic_version: 'bedrock-2023-05-31',
-          max_tokens: 1024,
-          messages: [
-            {
-              role: 'user',
-              content: prompt
-            }
-          ]
+        const command = new InvokeModelCommand({
+          modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({
+            anthropic_version: 'bedrock-2023-05-31',
+            max_tokens: 1024,
+            messages: [
+              {
+                role: 'user',
+                content: prompt
+              }
+            ]
+          })
         })
-      })
 
-      const response = await bedrockClient.send(command)
-      const responseBody = JSON.parse(new TextDecoder().decode(response.body))
-      const aiContent = responseBody.content?.[0]?.text
-      if (aiContent) {
-        try {
-          aiData = JSON.parse(aiContent)
-        } catch {
-          aiData = { raw: aiContent }
+        const response = await bedrockClient.send(command)
+        const responseBody = JSON.parse(new TextDecoder().decode(response.body))
+        const aiContent = responseBody.content?.[0]?.text
+        if (aiContent) {
+          try {
+            aiData = JSON.parse(aiContent)
+          } catch {
+            aiData = { raw: aiContent }
+          }
         }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error'
+        const errorStack = error instanceof Error ? error.stack : undefined
+        console.error('Bedrock error:', errorMsg, errorStack)
+        return c.json({ error: 'AI extraction failed', detail: errorMsg }, 500)
       }
     }
 
