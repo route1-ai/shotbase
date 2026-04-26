@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import { chromium } from 'playwright'
 import sharp from 'sharp'
 import Redis from 'ioredis'
+import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime'
 
 const app = new Hono()
 
@@ -29,6 +30,22 @@ if (redisUrl) {
   })
 } else {
   console.log('Redis not configured, using in-memory fallback')
+}
+
+// AWS Bedrock client
+let bedrockClient: BedrockRuntimeClient | null = null
+const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID
+const awsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY
+const awsRegion = process.env.AWS_REGION ?? 'us-east-1'
+
+if (awsAccessKeyId && awsSecretAccessKey) {
+  bedrockClient = new BedrockRuntimeClient({
+    region: awsRegion,
+    credentials: {
+      accessKeyId: awsAccessKeyId,
+      secretAccessKey: awsSecretAccessKey
+    }
+  })
 }
 
 app.get('/health', (c) => c.json({ status: 'ok', service: 'shotbase' }))
@@ -121,11 +138,18 @@ app.post('/screenshot', async (c) => {
   const fullPage = ((body as { full_page?: unknown } | null)?.full_page as boolean) ?? false
   const width = ((body as { width?: unknown } | null)?.width as number) ?? 1440
   const height = ((body as { height?: unknown } | null)?.height as number) ?? 900
+  const includeText = ((body as { include_text?: unknown } | null)?.include_text as boolean) ?? false
+  const aiExtract = (body as { ai_extract?: unknown } | null)?.ai_extract as Record<string, boolean> | undefined
 
-  // Cache check with Redis
+  // Check for AI extract without credentials
+  if (aiExtract && !bedrockClient) {
+    return c.json({ error: 'AI extraction requires AWS Bedrock credentials' }, 400)
+  }
+
+  // Cache check with Redis (only for binary responses)
   const cacheKey = `cache:${url}:${format}`
 
-  if (redis) {
+  if (!includeText && !aiExtract && redis) {
     try {
       const cachedBase64 = await redis.get(cacheKey)
       if (cachedBase64) {
@@ -139,8 +163,8 @@ app.post('/screenshot', async (c) => {
     } catch (err) {
       console.error('Redis cache get error:', err)
     }
-  } else {
-    // In-memory fallback
+  } else if (!includeText && !aiExtract) {
+    // In-memory fallback for binary responses
     const cached = cacheMap.get(cacheKey)
     if (cached && now < cached.timestamp + CACHE_TTL_MS) {
       const contentType = getContentType(format)
@@ -151,6 +175,7 @@ app.post('/screenshot', async (c) => {
     }
   }
 
+  const startTime = Date.now()
   const browser = await chromium.launch()
   try {
     const page = await browser.newPage()
@@ -159,6 +184,14 @@ app.post('/screenshot', async (c) => {
       Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' })
     })
     await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 })
+
+    // Extract text if needed
+    let pageText: string | null = null
+    if (includeText || aiExtract) {
+      pageText = await page.evaluate(() => document.body.innerText)
+      // Clean up: trim and remove excessive blank lines
+      pageText = pageText.replace(/\n\s*\n/g, '\n\n').trim()
+    }
 
     let buffer: Buffer
     let contentType: string
@@ -181,6 +214,67 @@ app.post('/screenshot', async (c) => {
       const png = await page.screenshot({ type: 'png', fullPage })
       buffer = Buffer.from(png)
       contentType = 'image/png'
+    }
+
+    // AI Extract if requested
+    let aiData: Record<string, unknown> | undefined
+    if (aiExtract && bedrockClient && pageText) {
+      const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
+      const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields. For prices: array of price strings. For headings: array of main headings. For ctas: array of CTA button texts. No explanation. Just JSON.\n\nPage content:\n${pageText}\n\nRequested fields: ${JSON.stringify(fields)}`
+
+      const command = new InvokeModelCommand({
+        modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
+        contentType: 'application/json',
+        accept: 'application/json',
+        body: JSON.stringify({
+          anthropic_version: 'bedrock-2023-05-31',
+          max_tokens: 1024,
+          messages: [
+            {
+              role: 'user',
+              content: prompt
+            }
+          ]
+        })
+      })
+
+      const response = await bedrockClient.send(command)
+      const responseBody = JSON.parse(new TextDecoder().decode(response.body))
+      const aiContent = responseBody.content?.[0]?.text
+      if (aiContent) {
+        try {
+          aiData = JSON.parse(aiContent)
+        } catch {
+          aiData = { raw: aiContent }
+        }
+      }
+    }
+
+    const renderTime = Date.now() - startTime
+
+    // If include_text or ai_extract, return JSON response
+    if (includeText || aiExtract) {
+      // Cache the screenshot buffer in Redis
+      if (redis) {
+        try {
+          await redis.setex(cacheKey, 60, buffer.toString('base64'))
+        } catch (err) {
+          console.error('Redis cache set error:', err)
+        }
+      } else {
+        cacheMap.set(cacheKey, { buffer, format, timestamp: now })
+      }
+
+      return c.json({
+        screenshot_url: null,
+        format,
+        width,
+        height,
+        render_time_ms: renderTime,
+        cached: false,
+        text: includeText ? pageText : undefined,
+        ai_data: aiData
+      })
     }
 
     // Cache the result in Redis
