@@ -2,18 +2,34 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { chromium } from 'playwright'
 import sharp from 'sharp'
+import Redis from 'ioredis'
 
 const app = new Hono()
 
-// Rate limiting: Map<apiKey, {count, reset}>
-const rateLimitMap = new Map<string, { count: number; reset: number }>()
+// Redis client - will be null if connection fails
+let redis: Redis | null = null
 
-// Cache: Map<url+format, {buffer, format, timestamp}>
+// Fallback in-memory stores if Redis is unavailable
+const rateLimitMap = new Map<string, { count: number; reset: number }>()
 const cacheMap = new Map<string, { buffer: Buffer; format: string; timestamp: number }>()
 
 const CACHE_TTL_MS = 60 * 1000
 const RATE_LIMIT_MAX = 10
 const RATE_LIMIT_WINDOW_MS = 60 * 1000
+
+// Connect to Redis on startup
+const redisUrl = process.env.REDIS_URL
+if (redisUrl) {
+  redis = new Redis(redisUrl)
+  redis.on('error', (err) => {
+    console.error('Redis connection error:', err.message)
+  })
+  redis.on('connect', () => {
+    console.log('Redis connected')
+  })
+} else {
+  console.log('Redis not configured, using in-memory fallback')
+}
 
 app.get('/health', (c) => c.json({ status: 'ok', service: 'shotbase' }))
 
@@ -38,16 +54,54 @@ app.post('/screenshot', async (c) => {
     return c.json({ error: 'Invalid API key' }, 401)
   }
 
-  // Rate limiting check
+  // Rate limiting check with Redis
   const now = Date.now()
-  const rateLimitEntry = rateLimitMap.get(apiKey)
-  if (!rateLimitEntry || now >= rateLimitEntry.reset) {
-    rateLimitMap.set(apiKey, { count: 1, reset: now + RATE_LIMIT_WINDOW_MS })
-  } else {
-    if (rateLimitEntry.count >= RATE_LIMIT_MAX) {
-      return c.json({ error: 'Rate limit exceeded. Max 10 requests per minute.' }, 429)
+  let rateLimited = false
+
+  if (redis) {
+    try {
+      const rateLimitKey = `ratelimit:${apiKey}`
+      const currentCount = await redis.incr(rateLimitKey)
+      const ttl = await redis.ttl(rateLimitKey)
+
+      if (ttl === -1) {
+        // First request, set expiry
+        await redis.expire(rateLimitKey, 60)
+      }
+
+      if (currentCount > RATE_LIMIT_MAX) {
+        rateLimited = true
+      }
+    } catch (err) {
+      console.error('Redis rate limit error:', err)
+      // Fallback to in-memory
+      const rateLimitEntry = rateLimitMap.get(apiKey)
+      if (!rateLimitEntry || now >= rateLimitEntry.reset) {
+        rateLimitMap.set(apiKey, { count: 1, reset: now + RATE_LIMIT_WINDOW_MS })
+      } else {
+        if (rateLimitEntry.count >= RATE_LIMIT_MAX) {
+          rateLimited = true
+        } else {
+          rateLimitEntry.count++
+        }
+      }
     }
-    rateLimitEntry.count++
+  } else {
+    // In-memory fallback
+    const rateLimitEntry = rateLimitMap.get(apiKey)
+    if (!rateLimitEntry || now >= rateLimitEntry.reset) {
+      rateLimitMap.set(apiKey, { count: 1, reset: now + RATE_LIMIT_WINDOW_MS })
+    } else {
+      if (rateLimitEntry.count >= RATE_LIMIT_MAX) {
+        rateLimited = true
+      } else {
+        rateLimitEntry.count++
+      }
+    }
+  }
+
+  if (rateLimited) {
+    return c.json({ error: 'Rate limit exceeded. Max 10 requests per minute.' }, 429)
   }
 
   let body: unknown
@@ -68,15 +122,33 @@ app.post('/screenshot', async (c) => {
   const width = ((body as { width?: unknown } | null)?.width as number) ?? 1440
   const height = ((body as { height?: unknown } | null)?.height as number) ?? 900
 
-  // Cache key
-  const cacheKey = `${url}:${format}`
-  const cached = cacheMap.get(cacheKey)
-  if (cached && now < cached.timestamp + CACHE_TTL_MS) {
-    const contentType = getContentType(format)
-    return c.body(new Uint8Array(cached.buffer), 200, {
-      'Content-Type': contentType,
-      'X-Cache': 'HIT'
-    })
+  // Cache check with Redis
+  const cacheKey = `cache:${url}:${format}`
+
+  if (redis) {
+    try {
+      const cachedBase64 = await redis.get(cacheKey)
+      if (cachedBase64) {
+        const cachedBuffer = Buffer.from(cachedBase64, 'base64')
+        const contentType = getContentType(format)
+        return c.body(new Uint8Array(cachedBuffer), 200, {
+          'Content-Type': contentType,
+          'X-Cache': 'HIT'
+        })
+      }
+    } catch (err) {
+      console.error('Redis cache get error:', err)
+    }
+  } else {
+    // In-memory fallback
+    const cached = cacheMap.get(cacheKey)
+    if (cached && now < cached.timestamp + CACHE_TTL_MS) {
+      const contentType = getContentType(format)
+      return c.body(new Uint8Array(cached.buffer), 200, {
+        'Content-Type': contentType,
+        'X-Cache': 'HIT'
+      })
+    }
   }
 
   const browser = await chromium.launch()
@@ -111,8 +183,17 @@ app.post('/screenshot', async (c) => {
       contentType = 'image/png'
     }
 
-    // Cache the result
-    cacheMap.set(cacheKey, { buffer, format, timestamp: now })
+    // Cache the result in Redis
+    if (redis) {
+      try {
+        await redis.setex(cacheKey, 60, buffer.toString('base64'))
+      } catch (err) {
+        console.error('Redis cache set error:', err)
+      }
+    } else {
+      // In-memory fallback
+      cacheMap.set(cacheKey, { buffer, format, timestamp: now })
+    }
 
     return c.body(new Uint8Array(buffer), 200, {
       'Content-Type': contentType,

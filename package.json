@@ -9,6 +9,7 @@
   "dependencies": {
     "@hono/node-server": "^1.19.0",
     "hono": "^4.9.0",
+    "ioredis": "^5.10.1",
     "playwright": "^1.55.0",
     "sharp": "^0.34.5"
   },
