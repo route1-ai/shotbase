@@ -231,7 +231,7 @@ app.post('/screenshot', async (c) => {
         const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields. For prices: array of price strings. For headings: array of main headings. For ctas: array of CTA button texts. No explanation. Just JSON.\n\nPage content:\n${pageText}\n\nRequested fields: ${JSON.stringify(fields)}`
 
         const command = new InvokeModelCommand({
-          modelId: 'us.anthropic.claude-3-haiku-20240307-v1:0',
+          modelId: 'us.anthropic.claude-3-5-haiku-20241022-v1:0',
           contentType: 'application/json',
           accept: 'application/json',
           body: JSON.stringify({
