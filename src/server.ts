@@ -265,7 +265,7 @@ app.post('/screenshot', async (c) => {
         console.log(`Calling Bedrock with region: ${awsRegion}, model: anthropic.claude-haiku-4-5-20251001-v1:0`)
 
         const response = await bedrockClient.send(new ConverseCommand({
-          modelId: 'anthropic.claude-haiku-4-5-20251001-v1:0',
+          modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
           messages: [{
             role: 'user',
             content: [{ text: prompt }]
