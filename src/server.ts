@@ -246,7 +246,8 @@ app.post('/screenshot', async (c) => {
         const result = response.output?.message?.content?.[0]?.text
         if (result) {
           try {
-            aiData = JSON.parse(result)
+            const cleaned = result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+            aiData = JSON.parse(cleaned)
           } catch {
             aiData = { raw: result }
           }
