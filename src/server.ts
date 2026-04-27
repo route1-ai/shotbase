@@ -229,10 +229,10 @@ app.post('/screenshot', async (c) => {
         const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
         const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields. For prices: array of price strings. For headings: array of main headings. For ctas: array of CTA button texts. No explanation. Just JSON.\n\nPage content:\n${pageText}\n\nRequested fields: ${JSON.stringify(fields)}`
 
-        console.log(`Calling Bedrock with region: ${awsRegion}, model: us.anthropic.claude-haiku-4-5-20251001-v1:0`)
+        console.log(`Calling Bedrock with region: ${awsRegion}, model: anthropic.claude-haiku-4-5-20251001-v1:0`)
 
         const response = await bedrockClient.send(new ConverseCommand({
-          modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+          modelId: 'anthropic.claude-haiku-4-5-20251001-v1:0',
           messages: [{
             role: 'user',
             content: [{ text: prompt }]
