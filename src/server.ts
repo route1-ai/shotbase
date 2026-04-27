@@ -3,7 +3,7 @@ import { Hono } from 'hono'
 import { chromium } from 'playwright'
 import sharp from 'sharp'
 import Redis from 'ioredis'
-import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime'
+import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
 
 const app = new Hono()
 
@@ -226,34 +226,29 @@ app.post('/screenshot', async (c) => {
     let aiData: Record<string, unknown> | undefined
     if (aiExtract && bedrockClient && pageText) {
       try {
-        console.log(`Calling Bedrock with region: ${awsRegion}, model: anthropic.claude-3-haiku-20240307-v1:0`)
         const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
         const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields. For prices: array of price strings. For headings: array of main headings. For ctas: array of CTA button texts. No explanation. Just JSON.\n\nPage content:\n${pageText}\n\nRequested fields: ${JSON.stringify(fields)}`
 
-        const command = new InvokeModelCommand({
-          modelId: 'us.anthropic.claude-3-5-haiku-20241022-v1:0',
-          contentType: 'application/json',
-          accept: 'application/json',
-          body: JSON.stringify({
-            anthropic_version: 'bedrock-2023-05-31',
-            max_tokens: 1024,
-            messages: [
-              {
-                role: 'user',
-                content: prompt
-              }
-            ]
-          })
-        })
+        console.log(`Calling Bedrock with region: ${awsRegion}, model: us.anthropic.claude-haiku-4-5-20251001-v1:0`)
 
-        const response = await bedrockClient.send(command)
-        const responseBody = JSON.parse(new TextDecoder().decode(response.body))
-        const aiContent = responseBody.content?.[0]?.text
-        if (aiContent) {
+        const response = await bedrockClient.send(new ConverseCommand({
+          modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+          messages: [{
+            role: 'user',
+            content: [{ text: prompt }]
+          }],
+          inferenceConfig: {
+            maxTokens: 1024,
+            temperature: 0
+          }
+        }))
+
+        const result = response.output?.message?.content?.[0]?.text
+        if (result) {
           try {
-            aiData = JSON.parse(aiContent)
+            aiData = JSON.parse(result)
           } catch {
-            aiData = { raw: aiContent }
+            aiData = { raw: result }
           }
         }
       } catch (error) {
