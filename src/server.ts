@@ -4,7 +4,6 @@ import { chromium } from 'playwright'
 import sharp from 'sharp'
 import Redis from 'ioredis'
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
-import { BedrockClient, ListFoundationModelsCommand, ListInferenceProfilesCommand } from '@aws-sdk/client-bedrock'
 
 const app = new Hono()
 
@@ -50,38 +49,6 @@ if (awsAccessKeyId && awsSecretAccessKey) {
 }
 
 app.get('/health', (c) => c.json({ status: 'ok', service: 'shotbase' }))
-
-app.get('/debug/models', async (c) => {
-  const bedrock = new BedrockClient({
-    region: awsRegion,
-    credentials: awsAccessKeyId && awsSecretAccessKey ? {
-      accessKeyId: awsAccessKeyId,
-      secretAccessKey: awsSecretAccessKey
-    } : undefined
-  })
-
-  let foundationModels: unknown[] = []
-  let inferenceProfiles: unknown[] = []
-
-  try {
-    const modelsResponse = await bedrock.send(new ListFoundationModelsCommand({ byProvider: 'anthropic' }))
-    foundationModels = modelsResponse.modelSummaries ?? []
-  } catch (err) {
-    console.error('ListFoundationModels error:', err)
-  }
-
-  try {
-    const profilesResponse = await bedrock.send(new ListInferenceProfilesCommand({}))
-    inferenceProfiles = profilesResponse.inferenceProfileSummaries ?? []
-  } catch (err) {
-    console.error('ListInferenceProfiles error:', err)
-  }
-
-  return c.json({
-    foundation_models: foundationModels,
-    inference_profiles: inferenceProfiles
-  })
-})
 
 app.post('/screenshot', async (c) => {
   const authorization = c.req.header('Authorization')
