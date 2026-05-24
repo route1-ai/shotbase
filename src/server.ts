@@ -71,27 +71,33 @@ interface UnkeyResult {
 }
 
 async function verifyKey(apiKey: string): Promise<UnkeyResult> {
-  const unkeyApiId = process.env.UNKEY_API_ID
+  const rootKey = process.env.UNKEY_ROOT_KEY
 
   // Playground bypass — used by the Next.js proxy route
-  const rootKey = process.env.UNKEY_ROOT_KEY
   if (apiKey === 'playground_bypass' || (rootKey && apiKey === rootKey)) {
     return { valid: true, ownerId: 'playground', plan: 'pro' }
   }
 
-  // Dev fallback: static API_KEYS env var (no Unkey configured)
-  if (!unkeyApiId) {
+  // Dev fallback: static API_KEYS env var (no Unkey configured).
+  // v2 verify requires a workspace root key, so fall back when it's missing.
+  if (!rootKey) {
     const validKeys = (process.env.API_KEYS ?? '').split(',').map((k) => k.trim()).filter(Boolean)
     if (validKeys.includes(apiKey)) return { valid: true, ownerId: 'static-key', plan: 'free' }
     return { valid: false, plan: 'free', error: 'Invalid API key' }
   }
 
-  // Verify against Unkey
+  // Verify against Unkey v2 (https://api.unkey.com/v2/keys.verifyKey).
+  // - api.unkey.dev/v1 was decommissioned (causes ENOTFOUND in fetch).
+  // - v2 requires Bearer auth with the workspace root key.
+  // - v2 body is { key } only (no apiId); response is nested under `data`.
   try {
-    const res = await fetch('https://api.unkey.dev/v1/keys.verifyKey', {
+    const res = await fetch('https://api.unkey.com/v2/keys.verifyKey', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiId: unkeyApiId, key: apiKey }),
+      headers: {
+        'Authorization': `Bearer ${rootKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ key: apiKey }),
     })
 
     if (!res.ok) {
@@ -99,15 +105,24 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
       return { valid: false, plan: 'free', error: 'Key verification service unavailable' }
     }
 
-    const data = (await res.json()) as {
-      valid: boolean
-      ownerId?: string
-      meta?: { plan?: string }
-      error?: string
+    const body = (await res.json()) as {
+      data?: {
+        valid: boolean
+        code?: string
+        keyId?: string
+        ownerId?: string
+        meta?: { plan?: string }
+      }
+      error?: { title?: string }
     }
 
-    if (!data.valid) {
-      return { valid: false, plan: 'free', error: data.error || 'Invalid API key' }
+    const data = body.data
+    if (!data || !data.valid) {
+      return {
+        valid: false,
+        plan: 'free',
+        error: data?.code ?? body.error?.title ?? 'Invalid API key',
+      }
     }
 
     return { valid: true, ownerId: data.ownerId, plan: data.meta?.plan ?? 'free' }
