@@ -72,14 +72,16 @@ interface UnkeyResult {
 }
 
 async function verifyKey(apiKey: string): Promise<UnkeyResult> {
+  // Playground bypass — used by the Next.js proxy route.
+  // Secret value via PLAYGROUND_BYPASS_KEY (never hardcoded). UNKEY_ROOT_KEY also
+  // short-circuits. If neither env var is set, there is NO bypass — fail closed.
   const rootKey = process.env.UNKEY_ROOT_KEY
-
-  // Playground bypass — used by the Next.js proxy route
-  if (apiKey === 'playground_bypass' || (rootKey && apiKey === rootKey)) {
+  const bypassKey = process.env.PLAYGROUND_BYPASS_KEY
+  if ((bypassKey && apiKey === bypassKey) || (rootKey && apiKey === rootKey)) {
     return { valid: true, ownerId: 'playground', plan: 'pro' }
   }
 
-  // Dev fallback: static API_KEYS env var (no Unkey configured).
+  // Dev fallback: static API_KEYS env var (no Unkey root key configured → can't call v2).
   // v2 verify requires a workspace root key, so fall back when it's missing.
   if (!rootKey) {
     const validKeys = (process.env.API_KEYS ?? '').split(',').map((k) => k.trim()).filter(Boolean)
@@ -91,6 +93,7 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
   // - api.unkey.dev/v1 was decommissioned (causes ENOTFOUND in fetch).
   // - v2 requires Bearer auth with the workspace root key.
   // - v2 body is { key } only (no apiId); response is nested under `data`.
+  // - Owner = identity.externalId; plan lives in the key's meta.
   try {
     const res = await fetch('https://api.unkey.com/v2/keys.verifyKey', {
       method: 'POST',
@@ -108,17 +111,17 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
 
     const body = (await res.json()) as {
       data?: {
-        valid: boolean
+        valid?: boolean
         code?: string
         keyId?: string
-        ownerId?: string
+        identity?: { externalId?: string }
         meta?: { plan?: string }
       }
       error?: { title?: string }
     }
 
     const data = body.data
-    if (!data || !data.valid) {
+    if (!data?.valid) {
       return {
         valid: false,
         plan: 'free',
@@ -126,7 +129,7 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
       }
     }
 
-    return { valid: true, ownerId: data.ownerId, plan: data.meta?.plan ?? 'free' }
+    return { valid: true, ownerId: data.identity?.externalId, plan: data.meta?.plan ?? 'free' }
   } catch (err) {
     console.error('Unkey verify error:', err)
     return { valid: false, plan: 'free', error: 'Key verification failed' }
