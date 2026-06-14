@@ -10,11 +10,11 @@ Shotbase is a native [MCP](https://modelcontextprotocol.io) tool. Add it to Clau
 Claude Desktop, Cursor, or any MCP client:
 
 ```bash
-claude mcp add shotbase \
-  --transport http \
-  --header "Authorization: Bearer sk_your_shotbase_key" \
-  https://api.shotbase.dev/api/mcp
+claude mcp add --transport http shotbase https://api.shotbase.dev/api/mcp \
+  --header "Authorization: Bearer sk_your_shotbase_key"
 ```
+
+> The server URL must come right after the name; `--header` goes last (it's variadic).
 
 Then:
 
