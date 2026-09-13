@@ -1,12 +1,19 @@
 // Stage 2 MCP smoke test (SPEC_MCP_SERVER.md §7). No test-runner dependency.
 // Assumes the server is running. Configure via env:
-//   MCP_BASE (default http://localhost:3940)  MCP_KEY (default playground_bypass)
+//   MCP_BASE (default http://localhost:3940)  MCP_KEY (REQUIRED — no default, no fallback)
 //   SMOKE_URL (default https://example.com)
 // Exit 0 if all REQUIRED assertions pass (the extract-JSON assertion DEFERS while the
 // model is unreachable and turns into a real PASS automatically once it returns JSON).
 
 const BASE = process.env.MCP_BASE ?? 'http://localhost:3940'
-const KEY  = process.env.MCP_KEY  ?? 'playground_bypass'
+// MCP_KEY must be supplied explicitly. Never fall back to a hardcoded credential
+// (the old 'playground_bypass' literal was a public master key — removed).
+const KEY  = process.env.MCP_KEY
+if (!KEY) {
+  console.error('FATAL: MCP_KEY is required. Set it in the environment before running the smoke test.')
+  console.error('       (No default and no credential fallback — the server accepts no hardcoded key.)')
+  process.exit(2)
+}
 const URL_ = process.env.SMOKE_URL ?? 'https://example.com'
 const MCP = `${BASE}/api/mcp`
 
