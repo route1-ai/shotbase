@@ -60,8 +60,87 @@ async function getBrowser(): Promise<Browser> {
   return browser
 }
 
-// Warm up on startup
-getBrowser().catch((err) => console.error('Browser warmup failed:', err))
+// Warm up on startup (only when run as the entrypoint — not when imported by tests).
+if (require.main === module) {
+  getBrowser().catch((err) => console.error('Browser warmup failed:', err))
+}
+
+// ─── Browser Concurrency Gate ───────────────────────────────────────────────────
+// The browser is a singleton; unbounded simultaneous contexts exhaust CPU/RAM and
+// crash the process. This in-process gate caps active captures, queues a bounded
+// number of overflow requests, and rejects cleanly past that — no external infra.
+const MAX_BROWSER_CONCURRENCY  = Math.max(1, Math.floor(Number(process.env.MAX_BROWSER_CONCURRENCY ?? 4)) || 4)
+const MAX_BROWSER_QUEUE        = Math.max(0, Math.floor(Number(process.env.MAX_BROWSER_QUEUE ?? 20)) || 0)
+const BROWSER_QUEUE_TIMEOUT_MS = Math.max(0, Math.floor(Number(process.env.BROWSER_QUEUE_TIMEOUT_MS ?? 10_000)) || 0)
+
+type GateErrorKind = 'overloaded' | 'timeout'
+export class GateError extends Error {
+  kind: GateErrorKind
+  constructor(kind: GateErrorKind, message: string) { super(message); this.kind = kind }
+}
+export interface Permit { release: () => void }
+
+export class BrowserGate {
+  private active = 0
+  private waiters: Array<{ resolve: (p: Permit) => void; reject: (e: GateError) => void; timer: ReturnType<typeof setTimeout> }> = []
+  constructor(
+    private readonly maxConcurrency: number,
+    private readonly maxQueue: number,
+    private readonly queueTimeoutMs: number,
+  ) {}
+
+  get activeCount() { return this.active }
+  get queuedCount() { return this.waiters.length }
+
+  acquire(): Promise<Permit> {
+    // Free slot → take it immediately.
+    if (this.active < this.maxConcurrency) {
+      this.active++
+      return Promise.resolve(this.makePermit())
+    }
+    // No slot and queue is full → reject rather than grow memory without bound.
+    if (this.waiters.length >= this.maxQueue) {
+      return Promise.reject(new GateError('overloaded',
+        `Server at capacity (${this.maxConcurrency} active, queue full at ${this.maxQueue}).`))
+    }
+    // Otherwise wait in the bounded queue with a timeout.
+    return new Promise<Permit>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const i = this.waiters.findIndex((w) => w.timer === timer)
+        if (i !== -1) this.waiters.splice(i, 1)
+        reject(new GateError('timeout', `Timed out after ${this.queueTimeoutMs}ms waiting for a browser slot.`))
+      }, this.queueTimeoutMs)
+      if (typeof timer.unref === 'function') timer.unref() // don't keep the loop alive for a waiter
+      this.waiters.push({ resolve, reject, timer })
+    })
+  }
+
+  // Each permit releases exactly once; a double release must never over-grant a slot.
+  private makePermit(): Permit {
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        this.handoff()
+      },
+    }
+  }
+
+  // Hand the freed slot to the next waiter if any (active stays constant), else free it.
+  private handoff() {
+    const next = this.waiters.shift()
+    if (next) {
+      clearTimeout(next.timer)
+      next.resolve(this.makePermit())
+    } else {
+      this.active--
+    }
+  }
+}
+
+const browserGate = new BrowserGate(MAX_BROWSER_CONCURRENCY, MAX_BROWSER_QUEUE, BROWSER_QUEUE_TIMEOUT_MS)
+console.log(`Browser gate: concurrency=${MAX_BROWSER_CONCURRENCY} queue=${MAX_BROWSER_QUEUE} timeout=${BROWSER_QUEUE_TIMEOUT_MS}ms`)
 
 // ─── Unkey Key Verification ───────────────────────────────────────────────────
 interface UnkeyResult {
@@ -286,7 +365,7 @@ interface CaptureOpts {
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
       renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string }
-  | { ok: false; kind: 'ssrf' | 'capture'; message: string }
+  | { ok: false; kind: 'ssrf' | 'capture' | 'overloaded'; message: string; retryAfterMs?: number }
 
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
@@ -319,6 +398,18 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
         return { ok: true, buffer: cached.buffer, contentType: getContentType(format), format, width, height, renderTime: 0, cached: true, pageText: null }
       }
     }
+  }
+
+  // Concurrency gate — real browser work only. Cache hits / SSRF rejects above
+  // never reach here, so they never consume a slot. Acquire fails cleanly (queue
+  // full or wait timed out) without ever touching the browser.
+  let permit: Permit
+  try {
+    permit = await browserGate.acquire()
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Server busy'
+    logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
+    return { ok: false, kind: 'overloaded', message, retryAfterMs: BROWSER_QUEUE_TIMEOUT_MS || 1000 }
   }
 
   const b = await getBrowser()
@@ -400,6 +491,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     return { ok: false, kind: 'capture', message: msg }
   } finally {
     if (context) await context.close().catch(() => {})
+    permit.release() // ALWAYS — success, capture error, or browser crash/relaunch
   }
 }
 
@@ -412,6 +504,8 @@ app.get('/health', (c) =>
     supabase: !!supabase,
     bedrock: !!bedrockClient,
     browser: browser?.isConnected() ?? false,
+    browserActive: browserGate.activeCount,
+    browserQueued: browserGate.queuedCount,
   })
 )
 
@@ -510,6 +604,13 @@ app.post('/screenshot', async (c) => {
   const r = await performCapture({ url, format, fullPage, width, height, includeText, aiExtract, ownerId })
   if (!r.ok) {
     if (r.kind === 'ssrf') return c.json({ error: 'Blocked URL', detail: r.message }, 400)
+    if (r.kind === 'overloaded') {
+      return c.json(
+        { error: 'Server busy', detail: r.message },
+        503,
+        { 'Retry-After': String(Math.ceil((r.retryAfterMs ?? 1000) / 1000)) },
+      )
+    }
     return c.json({ error: 'Screenshot failed', detail: r.message }, 500)
   }
   // Preserve existing behavior: a Bedrock failure during ai_extract is a 500.
@@ -639,8 +740,11 @@ app.post('/api/mcp', async (c) => {
       })
 
       if (!r.ok) {
+        const text = r.kind === 'ssrf' ? `Blocked URL: ${r.message}`
+          : r.kind === 'overloaded' ? `Server busy: ${r.message}`
+          : `Capture failed: ${r.message}`
         return c.json(rpcResult(id, {
-          content: [{ type: 'text', text: r.kind === 'ssrf' ? `Blocked URL: ${r.message}` : `Capture failed: ${r.message}` }],
+          content: [{ type: 'text', text }],
           isError: true,
         }))
       }
@@ -669,6 +773,10 @@ app.post('/api/mcp', async (c) => {
 })
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-const port = Number(process.env.PORT ?? 3000)
-console.log(`Shotbase starting on port ${port}`)
-serve({ fetch: app.fetch, port })
+// Only bind the port when run directly. Importing this module (e.g. from a unit
+// test for BrowserGate) must not start a listener.
+if (require.main === module) {
+  const port = Number(process.env.PORT ?? 3000)
+  console.log(`Shotbase starting on port ${port}`)
+  serve({ fetch: app.fetch, port })
+}
