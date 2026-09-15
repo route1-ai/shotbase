@@ -148,6 +148,10 @@ interface UnkeyResult {
   ownerId?: string
   plan: string
   error?: string
+  // True ONLY when the caller authenticated with the PLAYGROUND_BYPASS_KEY secret
+  // (the trusted frontend proxy). Gates whether the X-Shotbase-User-Id header is
+  // trusted for attribution. The root key does NOT set this.
+  viaBypass?: boolean
 }
 
 async function verifyKey(apiKey: string): Promise<UnkeyResult> {
@@ -156,7 +160,12 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
   // short-circuits. If neither env var is set, there is NO bypass — fail closed.
   const rootKey = process.env.UNKEY_ROOT_KEY
   const bypassKey = process.env.PLAYGROUND_BYPASS_KEY
-  if ((bypassKey && apiKey === bypassKey) || (rootKey && apiKey === rootKey)) {
+  // Bypass secret → trusted proxy: mark viaBypass so the caller must assert a user.
+  if (bypassKey && apiKey === bypassKey) {
+    return { valid: true, ownerId: 'playground', plan: 'pro', viaBypass: true }
+  }
+  // Root key → admin short-circuit. NOT the proxy; header is never trusted here.
+  if (rootKey && apiKey === rootKey) {
     return { valid: true, ownerId: 'playground', plan: 'pro' }
   }
 
@@ -213,6 +222,33 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
     console.error('Unkey verify error:', err)
     return { valid: false, plan: 'free', error: 'Key verification failed' }
   }
+}
+
+// ─── Owner Attribution ────────────────────────────────────────────────────────
+// Resolve the user a capture is billed/logged to.
+//  - viaBypass (trusted frontend proxy): attribute to the Clerk user id supplied in
+//    the internal X-Shotbase-User-Id header. Missing/blank/malformed → FAIL CLOSED
+//    (never fall back to a generic "playground" owner).
+//  - Any other caller (Unkey key, static key, root key): use the key's own ownerId.
+//    The header is IGNORED, so an ordinary client can't spoof another user.
+// Clerk ids are opaque strings like "user_2ab…"; accept only a safe, bounded charset.
+const INTERNAL_USER_HEADER = 'X-Shotbase-User-Id'
+export function isValidUserId(id: string): boolean {
+  return id.length >= 1 && id.length <= 255 && /^[A-Za-z0-9_-]+$/.test(id)
+}
+export function resolveOwner(
+  keyResult: UnkeyResult,
+  userIdHeader: string | undefined,
+): { ok: true; ownerId: string } | { ok: false; message: string } {
+  if (keyResult.viaBypass) {
+    const uid = userIdHeader?.trim() ?? ''
+    if (!uid || !isValidUserId(uid)) {
+      // Do not echo the raw header value (avoid leaking/handling untrusted ids).
+      return { ok: false, message: 'Missing or invalid internal user attribution' }
+    }
+    return { ok: true, ownerId: uid }
+  }
+  return { ok: true, ownerId: keyResult.ownerId ?? 'unknown' }
 }
 
 // ─── Plan-based Rate Limits ───────────────────────────────────────────────────
@@ -521,7 +557,11 @@ app.post('/screenshot', async (c) => {
   const keyResult = await verifyKey(apiKey)
   if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
 
-  const ownerId = keyResult.ownerId ?? 'unknown'
+  // Attribute to the real user. Bypass callers MUST assert a valid user id or we
+  // fail closed (never log as generic "playground"). Non-bypass keys ignore the header.
+  const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
+  if (!owner.ok) return c.json({ error: owner.message }, 401)
+  const ownerId = owner.ownerId
   const plan = keyResult.plan
 
   // ── Rate limit ────────────────────────────────────────────────────────────
@@ -717,6 +757,13 @@ app.post('/api/mcp', async (c) => {
         return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Error: "url" is required.' }], isError: true }))
       }
 
+      // Attribution — same rule as /screenshot. Real API keys use their own ownerId
+      // (header ignored → no spoofing); a bypass caller must assert a valid user id.
+      const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
+      if (!owner.ok) {
+        return c.json(rpcError(id, -32001, 'unauthorized'), 200)
+      }
+
       // Rate limit — same per-plan buckets as /screenshot.
       if (await checkRateLimit(apiKey, keyResult.plan)) {
         const limit = getRateLimitPerMinute(keyResult.plan)
@@ -736,7 +783,7 @@ app.post('/api/mcp', async (c) => {
         height: typeof viewport.height === 'number' ? viewport.height : 900,
         includeText: false,
         aiExtract: extract ? { page_type: true, headings: true, ctas: true, prices: true } : undefined,
-        ownerId: keyResult.ownerId ?? 'unknown',
+        ownerId: owner.ownerId,
       })
 
       if (!r.ok) {

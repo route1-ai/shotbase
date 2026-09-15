@@ -25,7 +25,8 @@ const defer= (m) => { deferred++; console.log(`  DEFERRED ${m}`) }
 async function rpc(method, params, key = KEY) {
   const res = await fetch(MCP, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+    // Bypass key now requires an internal user id (trusted-proxy attribution).
+    headers: { 'Content-Type': 'application/json', 'X-Shotbase-User-Id': process.env.MCP_USER ?? 'user_smoketest', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   })
   return { status: res.status, body: await res.json().catch(() => null) }

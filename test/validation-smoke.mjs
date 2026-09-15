@@ -21,7 +21,7 @@ const bad = (m) => { fail++; console.log(`  FAIL  ${m}`) }
 async function post(body) {
   const res = await fetch(EP, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', 'X-Shotbase-User-Id': 'user_valsmoke' },
     body: JSON.stringify(body),
   })
   const ct = res.headers.get('content-type') ?? ''

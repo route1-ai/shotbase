@@ -15,7 +15,7 @@ const ok  = (m) => { pass++; console.log(`  PASS  ${m}`) }
 const bad = (m) => { fail++; console.log(`  FAIL  ${m}`) }
 const assert = (c, m) => (c ? ok(m) : bad(m))
 
-const auth = { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }
+const auth = { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', 'X-Shotbase-User-Id': 'user_overload' }
 
 async function shot() {
   const res = await fetch(`${BASE}/screenshot`, { method: 'POST', headers: auth, body: JSON.stringify({ url: URL_ }) })
