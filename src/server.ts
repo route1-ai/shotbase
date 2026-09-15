@@ -296,8 +296,11 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const safe = await validateSafeUrl(url)
   if (!safe.ok) return { ok: false, kind: 'ssrf', message: safe.reason }
 
-  // Cache (image-only modes, mirrors the original handler)
-  const cacheKey = `cache:${url}:${format}:${fullPage}`
+  // Cache (image-only modes, mirrors the original handler).
+  // Key MUST include every render-affecting parameter — width/height changed the
+  // pixels but were previously omitted, so a 320-wide and a 1440-wide capture of
+  // the same URL collided and served the wrong image.
+  const cacheKey = `cache:${url}:${format}:${fullPage}:${width}x${height}`
   const now = Date.now()
   if (!includeText && !aiExtract) {
     if (redis) {
@@ -441,17 +444,63 @@ app.post('/screenshot', async (c) => {
   let body: Record<string, unknown> | null = null
   try { body = await c.req.json() } catch { /* stays null */ }
 
+  // ── Validate inputs ─────────────────────────────────────────────────────────
+  // Backend stands alone (direct callers + MCP bypass the frontend's zod schema).
+  // Bounds mirror the frontend lib/validation.ts where they overlap; the 1440×900
+  // viewport defaults are the backend's existing contract and are intentionally kept.
   const url = body?.url
   if (typeof url !== 'string' || !url.trim()) {
     return c.json({ error: 'Missing or invalid "url" field' }, 400)
   }
+  if (url.length > 2048) {
+    return c.json({ error: '"url" exceeds the 2048-character limit' }, 400)
+  }
 
-  const format      = (body?.format as string)    ?? 'png'
-  const fullPage    = (body?.full_page as boolean) ?? false
-  const width       = (body?.width as number)      ?? 1440
-  const height      = (body?.height as number)     ?? 900
-  const includeText = (body?.include_text as boolean) ?? false
-  const aiExtract   = body?.ai_extract as Record<string, boolean> | undefined
+  const format = (body?.format ?? 'png') as string
+  if (!['png', 'jpeg', 'webp', 'pdf'].includes(format)) {
+    return c.json({ error: 'Invalid "format" — must be one of: png, jpeg, webp, pdf' }, 400)
+  }
+
+  const fullPage = body?.full_page ?? false
+  if (typeof fullPage !== 'boolean') {
+    return c.json({ error: '"full_page" must be a boolean' }, 400)
+  }
+
+  const includeText = body?.include_text ?? false
+  if (typeof includeText !== 'boolean') {
+    return c.json({ error: '"include_text" must be a boolean' }, 400)
+  }
+
+  // Viewport — must be integers inside safe render bounds (prevents overflow /
+  // pathological allocations). Defaults preserve prior behavior.
+  const width = (body?.width ?? 1440) as number
+  if (!Number.isInteger(width) || width < 100 || width > 3840) {
+    return c.json({ error: '"width" must be an integer between 100 and 3840' }, 400)
+  }
+  const height = (body?.height ?? 900) as number
+  if (!Number.isInteger(height) || height < 100 || height > 2160) {
+    return c.json({ error: '"height" must be an integer between 100 and 2160' }, 400)
+  }
+
+  // ai_extract — a plain object of boolean flags, field-count capped (B6). Reject
+  // arrays, null, non-objects, or non-boolean values rather than coercing silently.
+  let aiExtract: Record<string, boolean> | undefined
+  const rawExtract = body?.ai_extract
+  if (rawExtract !== undefined && rawExtract !== null) {
+    if (typeof rawExtract !== 'object' || Array.isArray(rawExtract)) {
+      return c.json({ error: '"ai_extract" must be an object of boolean flags' }, 400)
+    }
+    const entries = Object.entries(rawExtract as Record<string, unknown>)
+    if (entries.length > 20) {
+      return c.json({ error: '"ai_extract" has too many fields (max 20)' }, 400)
+    }
+    for (const [k, v] of entries) {
+      if (typeof v !== 'boolean') {
+        return c.json({ error: `"ai_extract.${k}" must be a boolean` }, 400)
+      }
+    }
+    aiExtract = rawExtract as Record<string, boolean>
+  }
 
   if (aiExtract && !bedrockClient) {
     return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
