@@ -659,12 +659,10 @@ app.post('/screenshot', async (c) => {
     return c.json({ error: 'Screenshot failed', detail: r.message }, 500)
   }
   // Preserve existing behavior: a Bedrock failure during ai_extract is a 500.
-  if (aiExtract && r.aiError) {
-    // Full r.aiError already logged server-side in performCapture; do not leak it.
-    return c.json({ error: AI_EXTRACT_UNAVAILABLE_MSG }, 500)
-  }
-
-  // JSON response for text/AI modes
+  // JSON response for text/AI modes. A Bedrock failure no longer discards the
+  // successful render (Option B): return 200 with ai_data:null + a generic
+  // ai_error, mirroring MCP's graceful degradation. The raw provider error is
+  // logged server-side only (performCapture) and never returned to the client.
   if (includeText || aiExtract) {
     return c.json({
       screenshot_url: null,
@@ -674,7 +672,8 @@ app.post('/screenshot', async (c) => {
       render_time_ms: r.renderTime,
       cached: r.cached,
       text: includeText ? r.pageText : undefined,
-      ai_data: r.aiData,
+      ai_data: aiExtract ? (r.aiData ?? null) : undefined,
+      ai_error: (aiExtract && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
     })
   }
 
