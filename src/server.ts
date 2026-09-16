@@ -531,6 +531,11 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   }
 }
 
+// Client-facing message for any AI-extraction failure. The full provider error
+// (which can carry AWS account state, IAM/ARN details, or other internals) is
+// logged server-side only — never returned to the caller.
+const AI_EXTRACT_UNAVAILABLE_MSG = 'AI extraction temporarily unavailable'
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/health', (c) =>
   c.json({
@@ -655,7 +660,8 @@ app.post('/screenshot', async (c) => {
   }
   // Preserve existing behavior: a Bedrock failure during ai_extract is a 500.
   if (aiExtract && r.aiError) {
-    return c.json({ error: 'AI extraction failed', detail: r.aiError }, 500)
+    // Full r.aiError already logged server-side in performCapture; do not leak it.
+    return c.json({ error: AI_EXTRACT_UNAVAILABLE_MSG }, 500)
   }
 
   // JSON response for text/AI modes
@@ -807,7 +813,8 @@ app.post('/api/mcp', async (c) => {
         } else {
           // DEFERRED path: capture succeeded, intelligence unavailable (e.g. Bedrock gated).
           // Goes green automatically once the model returns JSON — no code change needed.
-          content.push({ type: 'text', text: `extraction_unavailable: ${r.aiError ?? 'model not reachable'}` })
+          // Generic marker only — the raw provider error (r.aiError) is logged server-side, never returned.
+          content.push({ type: 'text', text: `extraction_unavailable: ${AI_EXTRACT_UNAVAILABLE_MSG}` })
         }
       }
       return c.json(rpcResult(id, out))
