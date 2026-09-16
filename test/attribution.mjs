@@ -63,6 +63,12 @@ const mock = http.createServer((req, res) => {
       try { const p = JSON.parse(body); for (const row of Array.isArray(p) ? p : [p]) rows.push(row) } catch {}
       res.writeHead(201, { 'Content-Type': 'application/json' }); res.end('[]')
     })
+  } else if ((req.method === 'GET' || req.method === 'HEAD') && req.url.includes('/rest/v1/screenshots')) {
+    // Quota count query — report usage 0 so quota never blocks attribution scenarios.
+    res.writeHead(200, { 'Content-Type': 'application/json', 'content-range': '*/0' }); res.end('')
+  } else if (req.method === 'GET' && req.url.includes('/rest/v1/users')) {
+    // Quota plan lookup for bypass users.
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ plan: 'pro' }))
   } else { res.writeHead(200); res.end('ok') }
 })
 await new Promise((r) => mock.listen(0, '127.0.0.1', r))

@@ -1,5 +1,6 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { chromium, Browser, BrowserContext } from 'playwright'
 import sharp from 'sharp'
 import Redis from 'ioredis'
@@ -536,6 +537,91 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
 // logged server-side only — never returned to the caller.
 const AI_EXTRACT_UNAVAILABLE_MSG = 'AI extraction temporarily unavailable'
 
+// ─── Body-size protection (Phase B) ─────────────────────────────────────────────
+// Reject oversized/malformed-oversized requests before any browser or AI work, so a
+// giant payload can't exhaust memory. bodyLimit checks Content-Length and streams
+// with a hard cap; onError fires before the route handler runs.
+const MAX_BODY_BYTES = Math.max(1024, Math.floor(Number(process.env.MAX_BODY_BYTES ?? 1_048_576)) || 1_048_576)
+const screenshotBodyLimit = bodyLimit({
+  maxSize: MAX_BODY_BYTES,
+  onError: (c) => c.json({ error: 'Request body too large', detail: `Max ${MAX_BODY_BYTES} bytes` }, 413),
+})
+const mcpBodyLimit = bodyLimit({
+  maxSize: MAX_BODY_BYTES,
+  // Body never parsed → no JSON-RPC id to echo; use id:null per JSON-RPC.
+  onError: (c) => c.json(rpcError(null, -32600, 'Request too large'), 413),
+})
+
+// ─── Monthly Quota Enforcement (Phase C) ─────────────────────────────────────────
+// Per-plan monthly caps enforced at the backend for REST, MCP, and playground.
+// Enforcement is Supabase-backed: when Supabase is not configured at all, quota is
+// DISABLED by design (dev/self-host). When it IS configured but a required query
+// fails, we FAIL CLOSED (never silently allow unlimited).
+function getMonthlyQuota(plan: string): number {
+  switch (plan.toLowerCase()) {
+    case 'starter': return 50_000
+    case 'pro':     return 250_000
+    case 'scale':   return 1_500_000
+    default:        return 10_000 // free
+  }
+}
+function startOfMonthUtcIso(): string {
+  const n = new Date()
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1)).toISOString()
+}
+// Count this user's captures in the current UTC month. Cache hits ARE counted
+// (every served capture is a logged row). Returns null on query error (→ fail closed).
+async function getMonthlyUsage(userId: string): Promise<number | null> {
+  if (!supabase) return null
+  try {
+    const { count, error } = await supabase
+      .from('screenshots')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', startOfMonthUtcIso())
+    if (error) { console.error('Quota usage query error:', error.message); return null }
+    return count ?? 0
+  } catch (err) {
+    console.error('Quota usage query threw:', err instanceof Error ? err.message : 'unknown')
+    return null
+  }
+}
+// The real plan for a playground (bypass) user lives in Supabase users.plan.
+// Returns null on error/not-found (→ fail closed).
+async function getUserPlan(userId: string): Promise<string | null> {
+  if (!supabase) return null
+  try {
+    const { data, error } = await supabase.from('users').select('plan').eq('clerk_id', userId).single()
+    if (error || !data?.plan) { if (error) console.error('User plan query error:', error.message); return null }
+    return data.plan as string
+  } catch (err) {
+    console.error('User plan query threw:', err instanceof Error ? err.message : 'unknown')
+    return null
+  }
+}
+type QuotaResult =
+  | { ok: true; plan: string }
+  | { ok: false; kind: 'quota'; plan: string; limit: number; used: number }
+  | { ok: false; kind: 'accounting' }
+// Resolve effective plan + enforce the monthly cap. NOTE: non-atomic (count → serve
+// → fire-and-forget log), so concurrent requests at the boundary can overshoot the
+// limit by up to the number of in-flight captures before their log rows land.
+async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string): Promise<QuotaResult> {
+  if (!supabase) return { ok: true, plan: keyResult.plan } // quota disabled (no accounting backend)
+  // Playground → the user's real plan (fail closed if it can't be resolved).
+  let plan = keyResult.plan
+  if (keyResult.viaBypass) {
+    const real = await getUserPlan(ownerId)
+    if (real === null) return { ok: false, kind: 'accounting' }
+    plan = real
+  }
+  const usage = await getMonthlyUsage(ownerId)
+  if (usage === null) return { ok: false, kind: 'accounting' } // configured but query failed → fail closed
+  const limit = getMonthlyQuota(plan)
+  if (usage >= limit) return { ok: false, kind: 'quota', plan, limit, used: usage }
+  return { ok: true, plan }
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/health', (c) =>
   c.json({
@@ -550,7 +636,7 @@ app.get('/health', (c) =>
   })
 )
 
-app.post('/screenshot', async (c) => {
+app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const authorization = c.req.header('Authorization')
   if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
@@ -645,6 +731,18 @@ app.post('/screenshot', async (c) => {
     return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
   }
 
+  // ── Monthly quota ───────────────────────────────────────────────────────────
+  const quota = await checkMonthlyQuota(keyResult, ownerId)
+  if (!quota.ok) {
+    if (quota.kind === 'quota') {
+      return c.json(
+        { error: 'Monthly quota exceeded', detail: `${quota.plan} plan allows ${quota.limit} captures/month.`, limit: quota.limit, used: quota.used },
+        429,
+      )
+    }
+    return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
+  }
+
   // ── Capture (shared core) ──────────────────────────────────────────────────
   const r = await performCapture({ url, format, fullPage, width, height, includeText, aiExtract, ownerId })
   if (!r.ok) {
@@ -714,7 +812,7 @@ function rpcResult(id: unknown, result: unknown) {
 
 app.get('/api/mcp', (c) => c.json(rpcError(null, -32000, 'Method Not Allowed: use POST'), 405))
 
-app.post('/api/mcp', async (c) => {
+app.post('/api/mcp', mcpBodyLimit, async (c) => {
   let req: { jsonrpc?: string; id?: unknown; method?: string; params?: Record<string, unknown> } | null = null
   try { req = await c.req.json() } catch { return c.json(rpcError(null, -32700, 'Parse error'), 200) }
   if (!req || req.jsonrpc !== '2.0' || typeof req.method !== 'string') {
@@ -776,6 +874,15 @@ app.post('/api/mcp', async (c) => {
           content: [{ type: 'text', text: `Rate limit exceeded. ${keyResult.plan} plan allows ${limit} requests/minute.` }],
           isError: true,
         }))
+      }
+
+      // Monthly quota — same enforcement as /screenshot (REST + MCP equivalent).
+      const quota = await checkMonthlyQuota(keyResult, owner.ownerId)
+      if (!quota.ok) {
+        const text = quota.kind === 'quota'
+          ? `Monthly quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
+          : 'Usage temporarily unavailable'
+        return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
       }
 
       const extract  = args.extract !== false // default true
