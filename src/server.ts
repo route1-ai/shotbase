@@ -1,5 +1,6 @@
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { chromium, Browser, BrowserContext } from 'playwright'
 import sharp from 'sharp'
 import Redis from 'ioredis'
@@ -60,8 +61,87 @@ async function getBrowser(): Promise<Browser> {
   return browser
 }
 
-// Warm up on startup
-getBrowser().catch((err) => console.error('Browser warmup failed:', err))
+// Warm up on startup (only when run as the entrypoint — not when imported by tests).
+if (require.main === module) {
+  getBrowser().catch((err) => console.error('Browser warmup failed:', err))
+}
+
+// ─── Browser Concurrency Gate ───────────────────────────────────────────────────
+// The browser is a singleton; unbounded simultaneous contexts exhaust CPU/RAM and
+// crash the process. This in-process gate caps active captures, queues a bounded
+// number of overflow requests, and rejects cleanly past that — no external infra.
+const MAX_BROWSER_CONCURRENCY  = Math.max(1, Math.floor(Number(process.env.MAX_BROWSER_CONCURRENCY ?? 4)) || 4)
+const MAX_BROWSER_QUEUE        = Math.max(0, Math.floor(Number(process.env.MAX_BROWSER_QUEUE ?? 20)) || 0)
+const BROWSER_QUEUE_TIMEOUT_MS = Math.max(0, Math.floor(Number(process.env.BROWSER_QUEUE_TIMEOUT_MS ?? 10_000)) || 0)
+
+type GateErrorKind = 'overloaded' | 'timeout'
+export class GateError extends Error {
+  kind: GateErrorKind
+  constructor(kind: GateErrorKind, message: string) { super(message); this.kind = kind }
+}
+export interface Permit { release: () => void }
+
+export class BrowserGate {
+  private active = 0
+  private waiters: Array<{ resolve: (p: Permit) => void; reject: (e: GateError) => void; timer: ReturnType<typeof setTimeout> }> = []
+  constructor(
+    private readonly maxConcurrency: number,
+    private readonly maxQueue: number,
+    private readonly queueTimeoutMs: number,
+  ) {}
+
+  get activeCount() { return this.active }
+  get queuedCount() { return this.waiters.length }
+
+  acquire(): Promise<Permit> {
+    // Free slot → take it immediately.
+    if (this.active < this.maxConcurrency) {
+      this.active++
+      return Promise.resolve(this.makePermit())
+    }
+    // No slot and queue is full → reject rather than grow memory without bound.
+    if (this.waiters.length >= this.maxQueue) {
+      return Promise.reject(new GateError('overloaded',
+        `Server at capacity (${this.maxConcurrency} active, queue full at ${this.maxQueue}).`))
+    }
+    // Otherwise wait in the bounded queue with a timeout.
+    return new Promise<Permit>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const i = this.waiters.findIndex((w) => w.timer === timer)
+        if (i !== -1) this.waiters.splice(i, 1)
+        reject(new GateError('timeout', `Timed out after ${this.queueTimeoutMs}ms waiting for a browser slot.`))
+      }, this.queueTimeoutMs)
+      if (typeof timer.unref === 'function') timer.unref() // don't keep the loop alive for a waiter
+      this.waiters.push({ resolve, reject, timer })
+    })
+  }
+
+  // Each permit releases exactly once; a double release must never over-grant a slot.
+  private makePermit(): Permit {
+    let released = false
+    return {
+      release: () => {
+        if (released) return
+        released = true
+        this.handoff()
+      },
+    }
+  }
+
+  // Hand the freed slot to the next waiter if any (active stays constant), else free it.
+  private handoff() {
+    const next = this.waiters.shift()
+    if (next) {
+      clearTimeout(next.timer)
+      next.resolve(this.makePermit())
+    } else {
+      this.active--
+    }
+  }
+}
+
+const browserGate = new BrowserGate(MAX_BROWSER_CONCURRENCY, MAX_BROWSER_QUEUE, BROWSER_QUEUE_TIMEOUT_MS)
+console.log(`Browser gate: concurrency=${MAX_BROWSER_CONCURRENCY} queue=${MAX_BROWSER_QUEUE} timeout=${BROWSER_QUEUE_TIMEOUT_MS}ms`)
 
 // ─── Unkey Key Verification ───────────────────────────────────────────────────
 interface UnkeyResult {
@@ -69,17 +149,28 @@ interface UnkeyResult {
   ownerId?: string
   plan: string
   error?: string
+  // True ONLY when the caller authenticated with the PLAYGROUND_BYPASS_KEY secret
+  // (the trusted frontend proxy). Gates whether the X-Shotbase-User-Id header is
+  // trusted for attribution. The root key does NOT set this.
+  viaBypass?: boolean
 }
 
 async function verifyKey(apiKey: string): Promise<UnkeyResult> {
+  // Playground bypass — used by the Next.js proxy route.
+  // Secret value via PLAYGROUND_BYPASS_KEY (never hardcoded). UNKEY_ROOT_KEY also
+  // short-circuits. If neither env var is set, there is NO bypass — fail closed.
   const rootKey = process.env.UNKEY_ROOT_KEY
-
-  // Playground bypass — used by the Next.js proxy route
-  if (apiKey === 'playground_bypass' || (rootKey && apiKey === rootKey)) {
+  const bypassKey = process.env.PLAYGROUND_BYPASS_KEY
+  // Bypass secret → trusted proxy: mark viaBypass so the caller must assert a user.
+  if (bypassKey && apiKey === bypassKey) {
+    return { valid: true, ownerId: 'playground', plan: 'pro', viaBypass: true }
+  }
+  // Root key → admin short-circuit. NOT the proxy; header is never trusted here.
+  if (rootKey && apiKey === rootKey) {
     return { valid: true, ownerId: 'playground', plan: 'pro' }
   }
 
-  // Dev fallback: static API_KEYS env var (no Unkey configured).
+  // Dev fallback: static API_KEYS env var (no Unkey root key configured → can't call v2).
   // v2 verify requires a workspace root key, so fall back when it's missing.
   if (!rootKey) {
     const validKeys = (process.env.API_KEYS ?? '').split(',').map((k) => k.trim()).filter(Boolean)
@@ -91,6 +182,7 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
   // - api.unkey.dev/v1 was decommissioned (causes ENOTFOUND in fetch).
   // - v2 requires Bearer auth with the workspace root key.
   // - v2 body is { key } only (no apiId); response is nested under `data`.
+  // - Owner = identity.externalId; plan lives in the key's meta.
   try {
     const res = await fetch('https://api.unkey.com/v2/keys.verifyKey', {
       method: 'POST',
@@ -108,17 +200,17 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
 
     const body = (await res.json()) as {
       data?: {
-        valid: boolean
+        valid?: boolean
         code?: string
         keyId?: string
-        ownerId?: string
+        identity?: { externalId?: string }
         meta?: { plan?: string }
       }
       error?: { title?: string }
     }
 
     const data = body.data
-    if (!data || !data.valid) {
+    if (!data?.valid) {
       return {
         valid: false,
         plan: 'free',
@@ -126,11 +218,38 @@ async function verifyKey(apiKey: string): Promise<UnkeyResult> {
       }
     }
 
-    return { valid: true, ownerId: data.ownerId, plan: data.meta?.plan ?? 'free' }
+    return { valid: true, ownerId: data.identity?.externalId, plan: data.meta?.plan ?? 'free' }
   } catch (err) {
     console.error('Unkey verify error:', err)
     return { valid: false, plan: 'free', error: 'Key verification failed' }
   }
+}
+
+// ─── Owner Attribution ────────────────────────────────────────────────────────
+// Resolve the user a capture is billed/logged to.
+//  - viaBypass (trusted frontend proxy): attribute to the Clerk user id supplied in
+//    the internal X-Shotbase-User-Id header. Missing/blank/malformed → FAIL CLOSED
+//    (never fall back to a generic "playground" owner).
+//  - Any other caller (Unkey key, static key, root key): use the key's own ownerId.
+//    The header is IGNORED, so an ordinary client can't spoof another user.
+// Clerk ids are opaque strings like "user_2ab…"; accept only a safe, bounded charset.
+const INTERNAL_USER_HEADER = 'X-Shotbase-User-Id'
+export function isValidUserId(id: string): boolean {
+  return id.length >= 1 && id.length <= 255 && /^[A-Za-z0-9_-]+$/.test(id)
+}
+export function resolveOwner(
+  keyResult: UnkeyResult,
+  userIdHeader: string | undefined,
+): { ok: true; ownerId: string } | { ok: false; message: string } {
+  if (keyResult.viaBypass) {
+    const uid = userIdHeader?.trim() ?? ''
+    if (!uid || !isValidUserId(uid)) {
+      // Do not echo the raw header value (avoid leaking/handling untrusted ids).
+      return { ok: false, message: 'Missing or invalid internal user attribution' }
+    }
+    return { ok: true, ownerId: uid }
+  }
+  return { ok: true, ownerId: keyResult.ownerId ?? 'unknown' }
 }
 
 // ─── Plan-based Rate Limits ───────────────────────────────────────────────────
@@ -283,7 +402,7 @@ interface CaptureOpts {
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
       renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string }
-  | { ok: false; kind: 'ssrf' | 'capture'; message: string }
+  | { ok: false; kind: 'ssrf' | 'capture' | 'overloaded'; message: string; retryAfterMs?: number }
 
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
@@ -293,8 +412,11 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const safe = await validateSafeUrl(url)
   if (!safe.ok) return { ok: false, kind: 'ssrf', message: safe.reason }
 
-  // Cache (image-only modes, mirrors the original handler)
-  const cacheKey = `cache:${url}:${format}:${fullPage}`
+  // Cache (image-only modes, mirrors the original handler).
+  // Key MUST include every render-affecting parameter — width/height changed the
+  // pixels but were previously omitted, so a 320-wide and a 1440-wide capture of
+  // the same URL collided and served the wrong image.
+  const cacheKey = `cache:${url}:${format}:${fullPage}:${width}x${height}`
   const now = Date.now()
   if (!includeText && !aiExtract) {
     if (redis) {
@@ -313,6 +435,18 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
         return { ok: true, buffer: cached.buffer, contentType: getContentType(format), format, width, height, renderTime: 0, cached: true, pageText: null }
       }
     }
+  }
+
+  // Concurrency gate — real browser work only. Cache hits / SSRF rejects above
+  // never reach here, so they never consume a slot. Acquire fails cleanly (queue
+  // full or wait timed out) without ever touching the browser.
+  let permit: Permit
+  try {
+    permit = await browserGate.acquire()
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Server busy'
+    logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
+    return { ok: false, kind: 'overloaded', message, retryAfterMs: BROWSER_QUEUE_TIMEOUT_MS || 1000 }
   }
 
   const b = await getBrowser()
@@ -394,7 +528,98 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     return { ok: false, kind: 'capture', message: msg }
   } finally {
     if (context) await context.close().catch(() => {})
+    permit.release() // ALWAYS — success, capture error, or browser crash/relaunch
   }
+}
+
+// Client-facing message for any AI-extraction failure. The full provider error
+// (which can carry AWS account state, IAM/ARN details, or other internals) is
+// logged server-side only — never returned to the caller.
+const AI_EXTRACT_UNAVAILABLE_MSG = 'AI extraction temporarily unavailable'
+
+// ─── Body-size protection (Phase B) ─────────────────────────────────────────────
+// Reject oversized/malformed-oversized requests before any browser or AI work, so a
+// giant payload can't exhaust memory. bodyLimit checks Content-Length and streams
+// with a hard cap; onError fires before the route handler runs.
+const MAX_BODY_BYTES = Math.max(1024, Math.floor(Number(process.env.MAX_BODY_BYTES ?? 1_048_576)) || 1_048_576)
+const screenshotBodyLimit = bodyLimit({
+  maxSize: MAX_BODY_BYTES,
+  onError: (c) => c.json({ error: 'Request body too large', detail: `Max ${MAX_BODY_BYTES} bytes` }, 413),
+})
+const mcpBodyLimit = bodyLimit({
+  maxSize: MAX_BODY_BYTES,
+  // Body never parsed → no JSON-RPC id to echo; use id:null per JSON-RPC.
+  onError: (c) => c.json(rpcError(null, -32600, 'Request too large'), 413),
+})
+
+// ─── Monthly Quota Enforcement (Phase C) ─────────────────────────────────────────
+// Per-plan monthly caps enforced at the backend for REST, MCP, and playground.
+// Enforcement is Supabase-backed: when Supabase is not configured at all, quota is
+// DISABLED by design (dev/self-host). When it IS configured but a required query
+// fails, we FAIL CLOSED (never silently allow unlimited).
+function getMonthlyQuota(plan: string): number {
+  switch (plan.toLowerCase()) {
+    case 'starter': return 50_000
+    case 'pro':     return 250_000
+    case 'scale':   return 1_500_000
+    default:        return 10_000 // free
+  }
+}
+function startOfMonthUtcIso(): string {
+  const n = new Date()
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1)).toISOString()
+}
+// Count this user's captures in the current UTC month. Cache hits ARE counted
+// (every served capture is a logged row). Returns null on query error (→ fail closed).
+async function getMonthlyUsage(userId: string): Promise<number | null> {
+  if (!supabase) return null
+  try {
+    const { count, error } = await supabase
+      .from('screenshots')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', startOfMonthUtcIso())
+    if (error) { console.error('Quota usage query error:', error.message); return null }
+    return count ?? 0
+  } catch (err) {
+    console.error('Quota usage query threw:', err instanceof Error ? err.message : 'unknown')
+    return null
+  }
+}
+// The real plan for a playground (bypass) user lives in Supabase users.plan.
+// Returns null on error/not-found (→ fail closed).
+async function getUserPlan(userId: string): Promise<string | null> {
+  if (!supabase) return null
+  try {
+    const { data, error } = await supabase.from('users').select('plan').eq('clerk_id', userId).single()
+    if (error || !data?.plan) { if (error) console.error('User plan query error:', error.message); return null }
+    return data.plan as string
+  } catch (err) {
+    console.error('User plan query threw:', err instanceof Error ? err.message : 'unknown')
+    return null
+  }
+}
+type QuotaResult =
+  | { ok: true; plan: string }
+  | { ok: false; kind: 'quota'; plan: string; limit: number; used: number }
+  | { ok: false; kind: 'accounting' }
+// Resolve effective plan + enforce the monthly cap. NOTE: non-atomic (count → serve
+// → fire-and-forget log), so concurrent requests at the boundary can overshoot the
+// limit by up to the number of in-flight captures before their log rows land.
+async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string): Promise<QuotaResult> {
+  if (!supabase) return { ok: true, plan: keyResult.plan } // quota disabled (no accounting backend)
+  // Playground → the user's real plan (fail closed if it can't be resolved).
+  let plan = keyResult.plan
+  if (keyResult.viaBypass) {
+    const real = await getUserPlan(ownerId)
+    if (real === null) return { ok: false, kind: 'accounting' }
+    plan = real
+  }
+  const usage = await getMonthlyUsage(ownerId)
+  if (usage === null) return { ok: false, kind: 'accounting' } // configured but query failed → fail closed
+  const limit = getMonthlyQuota(plan)
+  if (usage >= limit) return { ok: false, kind: 'quota', plan, limit, used: usage }
+  return { ok: true, plan }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -406,10 +631,12 @@ app.get('/health', (c) =>
     supabase: !!supabase,
     bedrock: !!bedrockClient,
     browser: browser?.isConnected() ?? false,
+    browserActive: browserGate.activeCount,
+    browserQueued: browserGate.queuedCount,
   })
 )
 
-app.post('/screenshot', async (c) => {
+app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const authorization = c.req.header('Authorization')
   if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
@@ -421,7 +648,11 @@ app.post('/screenshot', async (c) => {
   const keyResult = await verifyKey(apiKey)
   if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
 
-  const ownerId = keyResult.ownerId ?? 'unknown'
+  // Attribute to the real user. Bypass callers MUST assert a valid user id or we
+  // fail closed (never log as generic "playground"). Non-bypass keys ignore the header.
+  const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
+  if (!owner.ok) return c.json({ error: owner.message }, 401)
+  const ownerId = owner.ownerId
   const plan = keyResult.plan
 
   // ── Rate limit ────────────────────────────────────────────────────────────
@@ -438,34 +669,98 @@ app.post('/screenshot', async (c) => {
   let body: Record<string, unknown> | null = null
   try { body = await c.req.json() } catch { /* stays null */ }
 
+  // ── Validate inputs ─────────────────────────────────────────────────────────
+  // Backend stands alone (direct callers + MCP bypass the frontend's zod schema).
+  // Bounds mirror the frontend lib/validation.ts where they overlap; the 1440×900
+  // viewport defaults are the backend's existing contract and are intentionally kept.
   const url = body?.url
   if (typeof url !== 'string' || !url.trim()) {
     return c.json({ error: 'Missing or invalid "url" field' }, 400)
   }
+  if (url.length > 2048) {
+    return c.json({ error: '"url" exceeds the 2048-character limit' }, 400)
+  }
 
-  const format      = (body?.format as string)    ?? 'png'
-  const fullPage    = (body?.full_page as boolean) ?? false
-  const width       = (body?.width as number)      ?? 1440
-  const height      = (body?.height as number)     ?? 900
-  const includeText = (body?.include_text as boolean) ?? false
-  const aiExtract   = body?.ai_extract as Record<string, boolean> | undefined
+  const format = (body?.format ?? 'png') as string
+  if (!['png', 'jpeg', 'webp', 'pdf'].includes(format)) {
+    return c.json({ error: 'Invalid "format" — must be one of: png, jpeg, webp, pdf' }, 400)
+  }
+
+  const fullPage = body?.full_page ?? false
+  if (typeof fullPage !== 'boolean') {
+    return c.json({ error: '"full_page" must be a boolean' }, 400)
+  }
+
+  const includeText = body?.include_text ?? false
+  if (typeof includeText !== 'boolean') {
+    return c.json({ error: '"include_text" must be a boolean' }, 400)
+  }
+
+  // Viewport — must be integers inside safe render bounds (prevents overflow /
+  // pathological allocations). Defaults preserve prior behavior.
+  const width = (body?.width ?? 1440) as number
+  if (!Number.isInteger(width) || width < 100 || width > 3840) {
+    return c.json({ error: '"width" must be an integer between 100 and 3840' }, 400)
+  }
+  const height = (body?.height ?? 900) as number
+  if (!Number.isInteger(height) || height < 100 || height > 2160) {
+    return c.json({ error: '"height" must be an integer between 100 and 2160' }, 400)
+  }
+
+  // ai_extract — a plain object of boolean flags, field-count capped (B6). Reject
+  // arrays, null, non-objects, or non-boolean values rather than coercing silently.
+  let aiExtract: Record<string, boolean> | undefined
+  const rawExtract = body?.ai_extract
+  if (rawExtract !== undefined && rawExtract !== null) {
+    if (typeof rawExtract !== 'object' || Array.isArray(rawExtract)) {
+      return c.json({ error: '"ai_extract" must be an object of boolean flags' }, 400)
+    }
+    const entries = Object.entries(rawExtract as Record<string, unknown>)
+    if (entries.length > 20) {
+      return c.json({ error: '"ai_extract" has too many fields (max 20)' }, 400)
+    }
+    for (const [k, v] of entries) {
+      if (typeof v !== 'boolean') {
+        return c.json({ error: `"ai_extract.${k}" must be a boolean` }, 400)
+      }
+    }
+    aiExtract = rawExtract as Record<string, boolean>
+  }
 
   if (aiExtract && !bedrockClient) {
     return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
+  }
+
+  // ── Monthly quota ───────────────────────────────────────────────────────────
+  const quota = await checkMonthlyQuota(keyResult, ownerId)
+  if (!quota.ok) {
+    if (quota.kind === 'quota') {
+      return c.json(
+        { error: 'Monthly quota exceeded', detail: `${quota.plan} plan allows ${quota.limit} captures/month.`, limit: quota.limit, used: quota.used },
+        429,
+      )
+    }
+    return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
   }
 
   // ── Capture (shared core) ──────────────────────────────────────────────────
   const r = await performCapture({ url, format, fullPage, width, height, includeText, aiExtract, ownerId })
   if (!r.ok) {
     if (r.kind === 'ssrf') return c.json({ error: 'Blocked URL', detail: r.message }, 400)
+    if (r.kind === 'overloaded') {
+      return c.json(
+        { error: 'Server busy', detail: r.message },
+        503,
+        { 'Retry-After': String(Math.ceil((r.retryAfterMs ?? 1000) / 1000)) },
+      )
+    }
     return c.json({ error: 'Screenshot failed', detail: r.message }, 500)
   }
   // Preserve existing behavior: a Bedrock failure during ai_extract is a 500.
-  if (aiExtract && r.aiError) {
-    return c.json({ error: 'AI extraction failed', detail: r.aiError }, 500)
-  }
-
-  // JSON response for text/AI modes
+  // JSON response for text/AI modes. A Bedrock failure no longer discards the
+  // successful render (Option B): return 200 with ai_data:null + a generic
+  // ai_error, mirroring MCP's graceful degradation. The raw provider error is
+  // logged server-side only (performCapture) and never returned to the client.
   if (includeText || aiExtract) {
     return c.json({
       screenshot_url: null,
@@ -475,7 +770,8 @@ app.post('/screenshot', async (c) => {
       render_time_ms: r.renderTime,
       cached: r.cached,
       text: includeText ? r.pageText : undefined,
-      ai_data: r.aiData,
+      ai_data: aiExtract ? (r.aiData ?? null) : undefined,
+      ai_error: (aiExtract && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
     })
   }
 
@@ -516,7 +812,7 @@ function rpcResult(id: unknown, result: unknown) {
 
 app.get('/api/mcp', (c) => c.json(rpcError(null, -32000, 'Method Not Allowed: use POST'), 405))
 
-app.post('/api/mcp', async (c) => {
+app.post('/api/mcp', mcpBodyLimit, async (c) => {
   let req: { jsonrpc?: string; id?: unknown; method?: string; params?: Record<string, unknown> } | null = null
   try { req = await c.req.json() } catch { return c.json(rpcError(null, -32700, 'Parse error'), 200) }
   if (!req || req.jsonrpc !== '2.0' || typeof req.method !== 'string') {
@@ -564,6 +860,13 @@ app.post('/api/mcp', async (c) => {
         return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Error: "url" is required.' }], isError: true }))
       }
 
+      // Attribution — same rule as /screenshot. Real API keys use their own ownerId
+      // (header ignored → no spoofing); a bypass caller must assert a valid user id.
+      const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
+      if (!owner.ok) {
+        return c.json(rpcError(id, -32001, 'unauthorized'), 200)
+      }
+
       // Rate limit — same per-plan buckets as /screenshot.
       if (await checkRateLimit(apiKey, keyResult.plan)) {
         const limit = getRateLimitPerMinute(keyResult.plan)
@@ -571,6 +874,15 @@ app.post('/api/mcp', async (c) => {
           content: [{ type: 'text', text: `Rate limit exceeded. ${keyResult.plan} plan allows ${limit} requests/minute.` }],
           isError: true,
         }))
+      }
+
+      // Monthly quota — same enforcement as /screenshot (REST + MCP equivalent).
+      const quota = await checkMonthlyQuota(keyResult, owner.ownerId)
+      if (!quota.ok) {
+        const text = quota.kind === 'quota'
+          ? `Monthly quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
+          : 'Usage temporarily unavailable'
+        return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
       }
 
       const extract  = args.extract !== false // default true
@@ -583,12 +895,15 @@ app.post('/api/mcp', async (c) => {
         height: typeof viewport.height === 'number' ? viewport.height : 900,
         includeText: false,
         aiExtract: extract ? { page_type: true, headings: true, ctas: true, prices: true } : undefined,
-        ownerId: keyResult.ownerId ?? 'unknown',
+        ownerId: owner.ownerId,
       })
 
       if (!r.ok) {
+        const text = r.kind === 'ssrf' ? `Blocked URL: ${r.message}`
+          : r.kind === 'overloaded' ? `Server busy: ${r.message}`
+          : `Capture failed: ${r.message}`
         return c.json(rpcResult(id, {
-          content: [{ type: 'text', text: r.kind === 'ssrf' ? `Blocked URL: ${r.message}` : `Capture failed: ${r.message}` }],
+          content: [{ type: 'text', text }],
           isError: true,
         }))
       }
@@ -604,7 +919,8 @@ app.post('/api/mcp', async (c) => {
         } else {
           // DEFERRED path: capture succeeded, intelligence unavailable (e.g. Bedrock gated).
           // Goes green automatically once the model returns JSON — no code change needed.
-          content.push({ type: 'text', text: `extraction_unavailable: ${r.aiError ?? 'model not reachable'}` })
+          // Generic marker only — the raw provider error (r.aiError) is logged server-side, never returned.
+          content.push({ type: 'text', text: `extraction_unavailable: ${AI_EXTRACT_UNAVAILABLE_MSG}` })
         }
       }
       return c.json(rpcResult(id, out))
@@ -617,6 +933,10 @@ app.post('/api/mcp', async (c) => {
 })
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-const port = Number(process.env.PORT ?? 3000)
-console.log(`Shotbase starting on port ${port}`)
-serve({ fetch: app.fetch, port })
+// Only bind the port when run directly. Importing this module (e.g. from a unit
+// test for BrowserGate) must not start a listener.
+if (require.main === module) {
+  const port = Number(process.env.PORT ?? 3000)
+  console.log(`Shotbase starting on port ${port}`)
+  serve({ fetch: app.fetch, port })
+}
