@@ -401,15 +401,30 @@ interface CaptureOpts {
 }
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
-      renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string }
+      renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string
+      timings?: Record<string, number>; fallbackUsed?: boolean }
   | { ok: false; kind: 'ssrf' | 'capture' | 'overloaded'; message: string; retryAfterMs?: number }
+
+// ─── Bounded navigation strategy (render reliability) ────────────────────────────
+// networkidle never settles on pages with continuous background traffic (ads,
+// analytics, websockets) → a 30s timeout used to DISCARD an otherwise-rendered page.
+// New strategy: wait for DOMContentLoaded (hard cap), then try networkidle only for a
+// short bound; if it doesn't settle, do a deterministic short settle and proceed
+// (never wait the full timeout before falling back).
+const NAV_TIMEOUT_MS         = Math.max(1000, Math.floor(Number(process.env.NAV_TIMEOUT_MS ?? 30_000)) || 30_000)
+const NAV_IDLE_MS            = Math.max(0, Math.floor(Number(process.env.NAV_IDLE_MS ?? 4_000)) || 4_000)
+const NAV_SETTLE_FALLBACK_MS = Math.max(0, Math.floor(Number(process.env.NAV_SETTLE_FALLBACK_MS ?? 750)) || 750)
 
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
   const startTime = Date.now()
+  const timings: Record<string, number> = {}
+  const mark = (k: string, from: number) => { timings[k] = Date.now() - from }
 
-  // SSRF guard — fail fast before touching the browser
+  // SSRF guard (incl. DNS resolution) — fail fast before touching the browser
+  const tValidate = Date.now()
   const safe = await validateSafeUrl(url)
+  mark('validationMs', tValidate)
   if (!safe.ok) return { ok: false, kind: 'ssrf', message: safe.reason }
 
   // Cache (image-only modes, mirrors the original handler).
@@ -441,6 +456,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   // never reach here, so they never consume a slot. Acquire fails cleanly (queue
   // full or wait timed out) without ever touching the browser.
   let permit: Permit
+  const tQueue = Date.now()
   try {
     permit = await browserGate.acquire()
   } catch (err) {
@@ -448,18 +464,46 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
     return { ok: false, kind: 'overloaded', message, retryAfterMs: BROWSER_QUEUE_TIMEOUT_MS || 1000 }
   }
+  mark('queueWaitMs', tQueue)
 
   const b = await getBrowser()
   let context: BrowserContext | null = null
+  let fallbackUsed = false
   try {
+    const tCtx = Date.now()
     context = await b.newContext()
     const page = await context.newPage()
     await page.setViewportSize({ width, height })
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' })
     })
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30_000 })
+    mark('contextCreateMs', tCtx)
 
+    // ── Bounded navigation ────────────────────────────────────────────────────
+    // 1) DOMContentLoaded (hard cap). A throw here IS a real navigation/capture failure.
+    const tNav = Date.now()
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
+    mark('navigationMs', tNav)
+    // 2) Try to reach networkidle, but only for a short bound. If it doesn't settle,
+    //    fall back to a deterministic settle delay instead of waiting the full timeout.
+    const tSettle = Date.now()
+    try {
+      await page.waitForLoadState('networkidle', { timeout: NAV_IDLE_MS })
+    } catch {
+      fallbackUsed = true
+      await page.waitForTimeout(NAV_SETTLE_FALLBACK_MS)
+    }
+    mark('settleMs', tSettle)
+    // 3) Meaningful-content guard: only discard if the page produced essentially nothing.
+    const hasContent = await page.evaluate(
+      () => ((document.body?.innerText || '').trim().length > 0) || ((document.body?.childElementCount ?? 0) > 3)
+    ).catch(() => true)
+    if (!hasContent) {
+      logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
+      return { ok: false, kind: 'capture', message: 'Navigation completed but page produced no content' }
+    }
+
+    const tText = Date.now()
     let pageText: string | null = null
     if (includeText || aiExtract) {
       try {
@@ -469,7 +513,9 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
         pageText = `extraction failed: ${err instanceof Error ? err.message : 'unknown'}`
       }
     }
+    mark('pageTextMs', tText)
 
+    const tShot = Date.now()
     let buffer: Buffer
     let contentType: string
     if (format === 'pdf') {
@@ -486,8 +532,10 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       buffer = Buffer.from(await page.screenshot({ type: 'png', fullPage }))
       contentType = 'image/png'
     }
+    mark('screenshotMs', tShot)
 
     // AI extraction — a Bedrock failure is reported via aiError; the image stays valid.
+    const tBedrock = Date.now()
     let aiData: Record<string, unknown> | undefined
     let aiError: string | undefined
     if (aiExtract && bedrockClient && pageText) {
@@ -512,7 +560,9 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       }
     }
 
+    mark('bedrockMs', tBedrock)
     const renderTime = Date.now() - startTime
+    timings.totalMs = renderTime
     if (redis) {
       try { await redis.setex(cacheKey, 60, buffer.toString('base64')) } catch {}
     } else {
@@ -520,7 +570,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     }
     logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false })
 
-    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError }
+    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     console.error('Screenshot error:', msg)
@@ -772,12 +822,14 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
       text: includeText ? r.pageText : undefined,
       ai_data: aiExtract ? (r.aiData ?? null) : undefined,
       ai_error: (aiExtract && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
+      fallback_used: r.fallbackUsed ?? false,
+      timings: r.timings,
     })
   }
 
   return c.body(new Uint8Array(r.buffer), 200, r.cached
     ? { 'Content-Type': r.contentType, 'X-Cache': 'HIT' }
-    : { 'Content-Type': r.contentType, 'X-Cache': 'MISS', 'X-Render-Time': String(r.renderTime) })
+    : { 'Content-Type': r.contentType, 'X-Cache': 'MISS', 'X-Render-Time': String(r.renderTime), 'X-Nav-Fallback': String(r.fallbackUsed ?? false) })
 })
 
 // ─── MCP Server (Stage 2 — streamable HTTP, JSON-RPC 2.0 at POST /api/mcp) ─────
