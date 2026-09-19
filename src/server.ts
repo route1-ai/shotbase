@@ -252,14 +252,47 @@ export function resolveOwner(
   return { ok: true, ownerId: keyResult.ownerId ?? 'unknown' }
 }
 
-// ─── Plan-based Rate Limits ───────────────────────────────────────────────────
-function getRateLimitPerMinute(plan: string): number {
-  switch (plan.toLowerCase()) {
-    case 'starter': return 60
-    case 'pro':     return 300
-    case 'scale':   return 1000
-    default:        return 10 // free
+// ─── Canonical Plan Configuration (single source of truth) ────────────────────
+// Pricing v2. Self-serve plans are exactly: free, builder, pro. Each value below
+// is the FINAL public contract (captures/month, AI extractions/month, req/min).
+//
+// Legacy compatibility ONLY: old key/test metadata may still say "starter"/"scale".
+// Those normalize to builder/pro — but the old Starter/Scale quota & rate VALUES
+// are intentionally dropped. Any unknown/blank plan → free (never a high allowance).
+//
+// Business is sales-assisted and is NOT auto-provisioned by this self-serve code:
+// no fixed Business limits are invented. A "business" plan value therefore
+// normalizes to free here (lowest allowance) until sales wiring exists — it can
+// never silently grant more than Free.
+export type CanonicalPlan = 'free' | 'builder' | 'pro'
+export interface PlanLimits { captureLimit: number; aiExtractionLimit: number; rpm: number }
+export const PLAN_CONFIG: Record<CanonicalPlan, PlanLimits> = {
+  free:    { captureLimit: 250,   aiExtractionLimit: 25,    rpm: 10 },
+  builder: { captureLimit: 1_500, aiExtractionLimit: 150,   rpm: 20 },
+  pro:     { captureLimit: 7_500, aiExtractionLimit: 1_000, rpm: 40 },
+}
+
+// Normalize any inbound plan string to a canonical self-serve plan id.
+export function normalizePlan(plan: string | null | undefined): CanonicalPlan {
+  switch ((plan ?? '').trim().toLowerCase()) {
+    case 'pro':     return 'pro'
+    case 'builder': return 'builder'
+    case 'scale':   return 'pro'      // legacy → pro
+    case 'starter': return 'builder'  // legacy → builder
+    case 'free':    return 'free'
+    default:        return 'free'      // unknown / business / blank → lowest allowance
   }
+}
+
+// ─── Plan-derived limits (all read from PLAN_CONFIG via normalizePlan) ─────────
+export function getRateLimitPerMinute(plan: string): number {
+  return PLAN_CONFIG[normalizePlan(plan)].rpm
+}
+export function getCaptureQuota(plan: string): number {
+  return PLAN_CONFIG[normalizePlan(plan)].captureLimit
+}
+export function getAiExtractionQuota(plan: string): number {
+  return PLAN_CONFIG[normalizePlan(plan)].aiExtractionLimit
 }
 
 const inMemoryRateLimit = new Map<string, { count: number; reset: number }>()
@@ -291,6 +324,10 @@ async function checkRateLimit(apiKey: string, plan: string): Promise<boolean> {
 }
 
 // ─── Supabase Usage Logging ───────────────────────────────────────────────────
+// NOTE: ai_requested / ai_succeeded require the matching Supabase columns. That
+// migration lives in the FRONTEND repo (see report). Until it lands, inserts that
+// include these fields will error — but logScreenshot is fire-and-forget, so it
+// only affects usage logging, never the response.
 async function logScreenshot(data: {
   userId: string
   url: string
@@ -299,6 +336,8 @@ async function logScreenshot(data: {
   timeMs: number
   sizeKb: number
   cached: boolean
+  aiRequested?: boolean  // true only when an AI extraction was actually requested
+  aiSucceeded?: boolean  // true only when Bedrock produced an AI result
 }) {
   if (!supabase) return
   try {
@@ -310,6 +349,8 @@ async function logScreenshot(data: {
       time_ms: data.timeMs,
       size_kb: Math.round(data.sizeKb),
       cached: data.cached,
+      ai_requested: data.aiRequested ?? false,
+      ai_succeeded: data.aiSucceeded ?? false,
       created_at: new Date().toISOString(),
     })
   } catch (err) {
@@ -417,6 +458,9 @@ const NAV_SETTLE_FALLBACK_MS = Math.max(0, Math.floor(Number(process.env.NAV_SET
 
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
+  // An ai_extract object where every value is false (or {}) is NOT an AI request:
+  // don't extract text for it, don't invoke Bedrock, don't consume AI quota.
+  const aiRequested = !!aiExtract && Object.values(aiExtract).some((v) => v === true)
   const startTime = Date.now()
   const timings: Record<string, number> = {}
   const mark = (k: string, from: number) => { timings[k] = Date.now() - from }
@@ -461,7 +505,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     permit = await browserGate.acquire()
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Server busy'
-    logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
+    logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
     return { ok: false, kind: 'overloaded', message, retryAfterMs: BROWSER_QUEUE_TIMEOUT_MS || 1000 }
   }
   mark('queueWaitMs', tQueue)
@@ -499,13 +543,13 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       () => ((document.body?.innerText || '').trim().length > 0) || ((document.body?.childElementCount ?? 0) > 3)
     ).catch(() => true)
     if (!hasContent) {
-      logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
+      logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
       return { ok: false, kind: 'capture', message: 'Navigation completed but page produced no content' }
     }
 
     const tText = Date.now()
     let pageText: string | null = null
-    if (includeText || aiExtract) {
+    if (includeText || aiRequested) {
       try {
         pageText = await page.evaluate(() => document.body.innerText)
         pageText = pageText?.replace(/\n\s*\n/g, '\n\n').trim() ?? null
@@ -538,7 +582,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     const tBedrock = Date.now()
     let aiData: Record<string, unknown> | undefined
     let aiError: string | undefined
-    if (aiExtract && bedrockClient && pageText) {
+    if (aiRequested && aiExtract && bedrockClient && pageText) {
       try {
         const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
         const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields.\n- page_type: one of [pricing, docs, blog, landing, product, other]\n- prices: array of price strings\n- headings: array of main headings\n- ctas: array of CTA button texts\nNo explanation. Just JSON.\n\nPage content:\n${pageText.slice(0, 8000)}\n\nRequested fields: ${JSON.stringify(fields)}`
@@ -561,6 +605,9 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     }
 
     mark('bedrockMs', tBedrock)
+    // ai_succeeded is true ONLY when Bedrock produced an AI result. A Bedrock
+    // failure (graceful degradation → aiData undefined + aiError) stays false.
+    const aiSucceeded = aiRequested && aiData !== undefined
     const renderTime = Date.now() - startTime
     timings.totalMs = renderTime
     if (redis) {
@@ -568,13 +615,13 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     } else {
       cacheMap.set(cacheKey, { buffer, format, timestamp: now })
     }
-    logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false })
+    logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false, aiRequested, aiSucceeded })
 
     return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     console.error('Screenshot error:', msg)
-    logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false })
+    logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
     return { ok: false, kind: 'capture', message: msg }
   } finally {
     if (context) await context.close().catch(() => {})
@@ -602,25 +649,22 @@ const mcpBodyLimit = bodyLimit({
   onError: (c) => c.json(rpcError(null, -32600, 'Request too large'), 413),
 })
 
-// ─── Monthly Quota Enforcement (Phase C) ─────────────────────────────────────────
+// ─── Monthly Quota Enforcement (Phase C — Pricing v2, dual quota) ────────────────
 // Per-plan monthly caps enforced at the backend for REST, MCP, and playground.
+// TWO independent quotas per the pricing contract:
+//   • captures       — every SUCCESSFUL served capture (status 200, incl. cache hits)
+//   • ai_extractions — every SUCCESSFUL AI extraction (status 200 AND ai_succeeded)
 // Enforcement is Supabase-backed: when Supabase is not configured at all, quota is
 // DISABLED by design (dev/self-host). When it IS configured but a required query
 // fails, we FAIL CLOSED (never silently allow unlimited).
-function getMonthlyQuota(plan: string): number {
-  switch (plan.toLowerCase()) {
-    case 'starter': return 50_000
-    case 'pro':     return 250_000
-    case 'scale':   return 1_500_000
-    default:        return 10_000 // free
-  }
-}
 function startOfMonthUtcIso(): string {
   const n = new Date()
   return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), 1)).toISOString()
 }
-// Count this user's captures in the current UTC month. Cache hits ARE counted
-// (every served capture is a logged row). Returns null on query error (→ fail closed).
+// Count this user's SUCCESSFUL captures in the current UTC month. Only status=200
+// rows count (auth/validation/SSRF/render/queue failures are logged but excluded);
+// cache hits DO count (they are served, status=200). Returns null on query error
+// (→ fail closed).
 async function getMonthlyUsage(userId: string): Promise<number | null> {
   if (!supabase) return null
   try {
@@ -628,11 +672,31 @@ async function getMonthlyUsage(userId: string): Promise<number | null> {
       .from('screenshots')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', userId)
+      .eq('status', 200)
       .gte('created_at', startOfMonthUtcIso())
     if (error) { console.error('Quota usage query error:', error.message); return null }
     return count ?? 0
   } catch (err) {
     console.error('Quota usage query threw:', err instanceof Error ? err.message : 'unknown')
+    return null
+  }
+}
+// Count this user's SUCCESSFUL AI extractions in the current UTC month:
+// status=200 AND ai_succeeded=true. Returns null on query error (→ fail closed).
+async function getMonthlyAiUsage(userId: string): Promise<number | null> {
+  if (!supabase) return null
+  try {
+    const { count, error } = await supabase
+      .from('screenshots')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .eq('status', 200)
+      .eq('ai_succeeded', true)
+      .gte('created_at', startOfMonthUtcIso())
+    if (error) { console.error('AI quota usage query error:', error.message); return null }
+    return count ?? 0
+  } catch (err) {
+    console.error('AI quota usage query threw:', err instanceof Error ? err.message : 'unknown')
     return null
   }
 }
@@ -649,27 +713,53 @@ async function getUserPlan(userId: string): Promise<string | null> {
     return null
   }
 }
-type QuotaResult =
-  | { ok: true; plan: string }
-  | { ok: false; kind: 'quota'; plan: string; limit: number; used: number }
-  | { ok: false; kind: 'accounting' }
-// Resolve effective plan + enforce the monthly cap. NOTE: non-atomic (count → serve
-// → fire-and-forget log), so concurrent requests at the boundary can overshoot the
-// limit by up to the number of in-flight captures before their log rows land.
-async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string): Promise<QuotaResult> {
-  if (!supabase) return { ok: true, plan: keyResult.plan } // quota disabled (no accounting backend)
-  // Playground → the user's real plan (fail closed if it can't be resolved).
-  let plan = keyResult.plan
-  if (keyResult.viaBypass) {
+
+// Resolve the effective, normalized plan to enforce for BOTH rate limiting and
+// monthly quotas. The trusted playground (bypass) key authenticates as a generic
+// 'pro' placeholder, so its REAL plan must be read from Supabase users.plan BEFORE
+// any user-facing limit is applied — otherwise a Free user coming through the
+// playground would inherit the placeholder's higher rate. Any other caller uses
+// its own key plan (the X-Shotbase-User-Id header is never trusted for plan).
+// Fails closed when accounting is configured but the plan lookup fails.
+type PlanResolution = { ok: true; plan: CanonicalPlan } | { ok: false; kind: 'accounting' }
+async function resolveEffectivePlan(keyResult: UnkeyResult, ownerId: string): Promise<PlanResolution> {
+  if (keyResult.viaBypass && supabase) {
     const real = await getUserPlan(ownerId)
     if (real === null) return { ok: false, kind: 'accounting' }
-    plan = real
+    return { ok: true, plan: normalizePlan(real) }
   }
-  const usage = await getMonthlyUsage(ownerId)
-  if (usage === null) return { ok: false, kind: 'accounting' } // configured but query failed → fail closed
-  const limit = getMonthlyQuota(plan)
-  if (usage >= limit) return { ok: false, kind: 'quota', plan, limit, used: usage }
-  return { ok: true, plan }
+  return { ok: true, plan: normalizePlan(keyResult.plan) }
+}
+
+type QuotaResult =
+  | { ok: true }
+  | { ok: false; kind: 'quota'; quotaType: 'captures' | 'ai_extractions'; plan: CanonicalPlan; limit: number; used: number }
+  | { ok: false; kind: 'accounting' }
+// Enforce the monthly caps for an already-resolved effective plan. Capture quota is
+// always checked; the AI-extraction quota only when the request actually asks for AI
+// (aiRequested). Capture-exhausted takes precedence over AI-exhausted. Any required
+// count query failing → accounting failure (fail closed). No-op when Supabase unset.
+// NOTE: non-atomic (count → serve → fire-and-forget log), so concurrent requests at
+// the boundary can overshoot by up to the number of in-flight captures.
+async function checkMonthlyQuota(plan: CanonicalPlan, ownerId: string, aiRequested: boolean): Promise<QuotaResult> {
+  if (!supabase) return { ok: true } // quota disabled (no accounting backend)
+
+  const captureUsage = await getMonthlyUsage(ownerId)
+  if (captureUsage === null) return { ok: false, kind: 'accounting' } // configured but query failed → fail closed
+  const captureLimit = getCaptureQuota(plan)
+  if (captureUsage >= captureLimit) {
+    return { ok: false, kind: 'quota', quotaType: 'captures', plan, limit: captureLimit, used: captureUsage }
+  }
+
+  if (aiRequested) {
+    const aiUsage = await getMonthlyAiUsage(ownerId)
+    if (aiUsage === null) return { ok: false, kind: 'accounting' }
+    const aiLimit = getAiExtractionQuota(plan)
+    if (aiUsage >= aiLimit) {
+      return { ok: false, kind: 'quota', quotaType: 'ai_extractions', plan, limit: aiLimit, used: aiUsage }
+    }
+  }
+  return { ok: true }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -703,7 +793,15 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
   if (!owner.ok) return c.json({ error: owner.message }, 401)
   const ownerId = owner.ownerId
-  const plan = keyResult.plan
+
+  // ── Effective plan ──────────────────────────────────────────────────────────
+  // Resolve the REAL, normalized plan before any user-facing limit. For a
+  // playground bypass caller this reads Supabase users.plan (so a Free user via the
+  // playground is rate-limited/quota'd as Free, not as the bypass's 'pro' placeholder).
+  // Configured-but-unresolvable → fail closed. Supabase unset → normalized key plan.
+  const effective = await resolveEffectivePlan(keyResult, ownerId)
+  if (!effective.ok) return c.json({ error: 'Usage temporarily unavailable' }, 503)
+  const plan = effective.plan
 
   // ── Rate limit ────────────────────────────────────────────────────────────
   const rateLimited = await checkRateLimit(apiKey, plan)
@@ -777,16 +875,26 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     aiExtract = rawExtract as Record<string, boolean>
   }
 
-  if (aiExtract && !bedrockClient) {
+  // An ai_extract with at least one true flag is a real AI request; {} or all-false
+  // is NOT (→ no Bedrock, no AI quota — treated like a plain capture).
+  const aiRequested = !!aiExtract && Object.values(aiExtract).some((v) => v === true)
+
+  if (aiRequested && !bedrockClient) {
     return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
   }
 
-  // ── Monthly quota ───────────────────────────────────────────────────────────
-  const quota = await checkMonthlyQuota(keyResult, ownerId)
+  // ── Monthly quota (dual: captures + AI extractions) ──────────────────────────
+  const quota = await checkMonthlyQuota(plan, ownerId, aiRequested)
   if (!quota.ok) {
     if (quota.kind === 'quota') {
+      const isAi = quota.quotaType === 'ai_extractions'
       return c.json(
-        { error: 'Monthly quota exceeded', detail: `${quota.plan} plan allows ${quota.limit} captures/month.`, limit: quota.limit, used: quota.used },
+        {
+          error: isAi ? 'Monthly AI extraction quota exceeded' : 'Monthly capture quota exceeded',
+          quota_type: quota.quotaType,
+          limit: quota.limit,
+          used: quota.used,
+        },
         429,
       )
     }
@@ -811,7 +919,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // successful render (Option B): return 200 with ai_data:null + a generic
   // ai_error, mirroring MCP's graceful degradation. The raw provider error is
   // logged server-side only (performCapture) and never returned to the client.
-  if (includeText || aiExtract) {
+  if (includeText || aiRequested) {
     return c.json({
       screenshot_url: null,
       format: r.format,
@@ -820,8 +928,8 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
       render_time_ms: r.renderTime,
       cached: r.cached,
       text: includeText ? r.pageText : undefined,
-      ai_data: aiExtract ? (r.aiData ?? null) : undefined,
-      ai_error: (aiExtract && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
+      ai_data: aiRequested ? (r.aiData ?? null) : undefined,
+      ai_error: (aiRequested && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
       fallback_used: r.fallbackUsed ?? false,
       timings: r.timings,
     })
@@ -919,25 +1027,40 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
         return c.json(rpcError(id, -32001, 'unauthorized'), 200)
       }
 
-      // Rate limit — same per-plan buckets as /screenshot.
-      if (await checkRateLimit(apiKey, keyResult.plan)) {
-        const limit = getRateLimitPerMinute(keyResult.plan)
+      // Effective plan — real plan for playground bypass (fail closed if unresolved),
+      // so RPM + quotas use the true plan, never the bypass's 'pro' placeholder.
+      const effective = await resolveEffectivePlan(keyResult, owner.ownerId)
+      if (!effective.ok) {
+        return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Usage temporarily unavailable' }], isError: true }))
+      }
+      const plan = effective.plan
+
+      // Rate limit — same per-plan buckets as /screenshot (effective plan).
+      if (await checkRateLimit(apiKey, plan)) {
+        const limit = getRateLimitPerMinute(plan)
         return c.json(rpcResult(id, {
-          content: [{ type: 'text', text: `Rate limit exceeded. ${keyResult.plan} plan allows ${limit} requests/minute.` }],
+          content: [{ type: 'text', text: `Rate limit exceeded. ${plan} plan allows ${limit} requests/minute.` }],
           isError: true,
         }))
       }
 
-      // Monthly quota — same enforcement as /screenshot (REST + MCP equivalent).
-      const quota = await checkMonthlyQuota(keyResult, owner.ownerId)
+      // extract=true (default) needs BOTH capture + AI quota; extract=false only capture.
+      const extract  = args.extract !== false // default true
+
+      // Monthly quota — dual (captures always; AI extractions only when extract=true).
+      const quota = await checkMonthlyQuota(plan, owner.ownerId, extract)
       if (!quota.ok) {
-        const text = quota.kind === 'quota'
-          ? `Monthly quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
-          : 'Usage temporarily unavailable'
+        let text: string
+        if (quota.kind === 'quota') {
+          text = quota.quotaType === 'ai_extractions'
+            ? `Monthly AI extraction quota exceeded. ${quota.plan} plan allows ${quota.limit} AI extractions/month (used ${quota.used}).`
+            : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
+        } else {
+          text = 'Usage temporarily unavailable'
+        }
         return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
       }
 
-      const extract  = args.extract !== false // default true
       const viewport = (args.viewport ?? {}) as { width?: number; height?: number }
       const r = await performCapture({
         url,
