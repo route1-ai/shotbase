@@ -108,29 +108,14 @@ try {
 
   // gate must be idle after all the above (permits released on the normal prepass path)
   assert(await gateIdle(B), 'BrowserGate drained to 0 after normal full-page captures')
+
+  // NOTE: prepass-FAILURE handling (graceful degradation + BrowserGate permit
+  // release + no slot leak + subsequent request works) is proven in
+  // test/fullpage-scroll.mjs (cases K/L) by injecting a throwing prepass function
+  // into the real runScrollPrepass wrapper + real BrowserGate — no production
+  // failure lever required.
 } finally {
   child.kill('SIGKILL'); await sleep(400)
-}
-
-// 9) prepass THROW → graceful capture + permit released
-child = startServer(3972, { FULLPAGE_SCROLL_FORCE_ERROR: '1' })
-const B2 = 'http://localhost:3972'
-if (!(await waitUp(B2))) { bad('force-error server failed to start') }
-else {
-  try {
-    const r = await shotJson(B2, 'user_err', { full_page: true, width: 800, height: 600 })
-    const te = r.body.timings || {}
-    assert(r.status === 200 && te.fullPageScrollError === 1,
-      `prepass throw → capture STILL succeeds (status=${r.status}, fullPageScrollError=${te.fullPageScrollError})`)
-    // give the fire-and-forget path a moment, then confirm no permit leak
-    await sleep(300)
-    assert(await gateIdle(B2), 'BrowserGate permit released even though prepass threw (gate idle)')
-    // and a second capture still works → no slot leaked
-    const r2 = await shotJson(B2, 'user_err2', { full_page: true, width: 801, height: 600 })
-    assert(r2.status === 200, `subsequent capture after prepass-throw still works (status=${r2.status}) → no slot leak`)
-  } finally {
-    child.kill('SIGKILL'); await sleep(300)
-  }
 }
 
 cleanup()

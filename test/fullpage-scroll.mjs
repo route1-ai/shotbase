@@ -3,7 +3,7 @@
 // every safety bound and behavior is proven without timing flakiness. (Real captures
 // can't target a local test server — the SSRF guard blocks private IPs.)
 
-import { scrollPrepass } from '../dist/server.js'
+import { scrollPrepass, runScrollPrepass, BrowserGate } from '../dist/server.js'
 
 let pass = 0, fail = 0
 const ok  = (m) => { pass++; console.log(`  PASS  ${m}`) }
@@ -149,6 +149,49 @@ reset()
   const { page } = mockPage({ initialHeight: 3000, viewportHeight: 800, grow })
   const d = await scrollPrepass(page, baseOpts({ maxSteps: 25, maxMs: 999_999 }))
   assert(d.steps <= 25, `step count never exceeds maxSteps (steps=${d.steps} <= 25)`)
+}
+
+// ── K) graceful failure handling — failure injected ONLY from the test ────────
+// runScrollPrepass is the exact production wrapper. We inject a throwing prepass
+// function (no production env var / runtime trigger) and prove: it degrades
+// gracefully (error diag, no rethrow), and — composed with the REAL BrowserGate
+// exactly like performCapture (acquire → prepass → finally release) — the permit
+// is released, no slot leaks, and a subsequent request acquires the freed slot.
+reset()
+{
+  const throwing = async () => { throw new Error('injected prepass failure') }
+  const { page } = mockPage({ initialHeight: 8000, viewportHeight: 1000 })
+
+  // Graceful: wrapper catches, returns an error-tagged diag, never rethrows.
+  const diag = await runScrollPrepass(page, baseOpts(), throwing)
+  assert(diag.error === true && diag.steps === 0, `injected prepass throw → graceful error diag, no rethrow (error=${diag.error})`)
+
+  // Permit lifecycle mirroring performCapture's acquire → prepass → finally release.
+  const gate = new BrowserGate(1, 0, 1000)
+  const permit = await gate.acquire()
+  assert(gate.activeCount === 1, 'gate: permit acquired (active=1)')
+  let captureContinued = false
+  try {
+    const d = await runScrollPrepass(page, baseOpts(), throwing) // must NOT throw
+    captureContinued = d.error === true // capture proceeds to screenshot after a failed prepass
+  } finally {
+    permit.release()
+  }
+  assert(captureContinued, 'capture CONTINUES after prepass failure (would proceed to screenshot)')
+  assert(gate.activeCount === 0, 'BrowserGate permit RELEASED after prepass-failure path (no leak)')
+  const p2 = await gate.acquire()
+  assert(gate.activeCount === 1, 'subsequent request ACQUIRES the freed slot (no slot leak)')
+  p2.release()
+  assert(gate.activeCount === 0, 'gate drains to 0 after subsequent request')
+}
+
+// ── L) injected non-Error throw is still handled safely ──────────────────────
+reset()
+{
+  const throwingStr = async () => { throw 'string failure' } // non-Error rejection
+  const { page } = mockPage()
+  const diag = await runScrollPrepass(page, baseOpts(), throwingStr)
+  assert(diag.error === true, 'non-Error prepass rejection still degrades gracefully')
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

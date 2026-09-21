@@ -489,9 +489,6 @@ const FULLPAGE_SCROLL_MAX_STEPS       = envInt('FULLPAGE_SCROLL_MAX_STEPS', 50, 
 const FULLPAGE_SCROLL_MAX_MS          = envInt('FULLPAGE_SCROLL_MAX_MS', 7_000, 500, 30_000)
 const FULLPAGE_SCROLL_MAX_HEIGHT_PX   = envInt('FULLPAGE_SCROLL_MAX_HEIGHT_PX', 40_000, 2_000, 200_000)
 const FULLPAGE_SCROLL_FINAL_SETTLE_MS = envInt('FULLPAGE_SCROLL_FINAL_SETTLE_MS', 250, 0, 5_000)
-// Test-only lever (default OFF): force the prepass to throw so tests can prove the
-// capture degrades gracefully AND the BrowserGate permit is still released.
-const FULLPAGE_SCROLL_FORCE_ERROR     = envBool('FULLPAGE_SCROLL_FORCE_ERROR', false)
 
 // Cache version — bump when rendered output changes so a stale (pre-fix, blank)
 // full-page image can't be served from cache after rollout. TTL is only 60s, so
@@ -551,6 +548,26 @@ export async function scrollPrepass(page: ScrollPage, opts: ScrollPrepassOpts): 
     m = await page.metrics()
   }
   return { ms: now() - start, steps, initialHeight, maxHeight, boundHit, boundReason }
+}
+
+// Graceful wrapper around the prepass: a traversal error must NEVER fail an
+// otherwise-good capture — log it safely and continue with an error-tagged diag.
+// The prepass function is injectable (defaults to the real one) so tests can force
+// a failure WITHOUT any production env var or runtime trigger.
+export type ScrollPrepassResult = ScrollDiag & { error?: boolean }
+export async function runScrollPrepass(
+  page: ScrollPage,
+  opts: ScrollPrepassOpts,
+  prepassFn: (p: ScrollPage, o: ScrollPrepassOpts) => Promise<ScrollDiag> = scrollPrepass,
+): Promise<ScrollPrepassResult> {
+  const now = opts.now ?? Date.now
+  const start = now()
+  try {
+    return await prepassFn(page, opts)
+  } catch (err) {
+    console.error('Scroll prepass error (continuing to capture):', err instanceof Error ? err.message : 'unknown')
+    return { ms: now() - start, steps: 0, initialHeight: 0, maxHeight: 0, boundHit: false, boundReason: '', error: true }
+  }
 }
 
 // Adapter: drive a real Playwright page through the ScrollPage surface.
@@ -668,22 +685,17 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     // page at the position reached (never scroll back to top) because reverse-on-
     // scroll reveals would otherwise un-trigger before the screenshot. A prepass
     // error degrades gracefully: log it and still capture the state reached.
-    let scrollDiag: (ScrollDiag & { error?: boolean }) | undefined
+    let scrollDiag: ScrollPrepassResult | undefined
     if (fullPage && FULLPAGE_SCROLL_ENABLED && format !== 'pdf') {
-      const tScroll = Date.now()
-      try {
-        if (FULLPAGE_SCROLL_FORCE_ERROR) throw new Error('forced scroll prepass error (test lever)')
-        scrollDiag = await scrollPrepass(playwrightScrollPage(page), {
-          stepRatio: FULLPAGE_SCROLL_STEP_RATIO,
-          stepWaitMs: FULLPAGE_SCROLL_STEP_WAIT_MS,
-          maxSteps: FULLPAGE_SCROLL_MAX_STEPS,
-          maxMs: FULLPAGE_SCROLL_MAX_MS,
-          maxHeightPx: FULLPAGE_SCROLL_MAX_HEIGHT_PX,
-        })
-      } catch (err) {
-        console.error('Scroll prepass error (continuing to capture):', err instanceof Error ? err.message : 'unknown')
-        scrollDiag = { ms: Date.now() - tScroll, steps: 0, initialHeight: 0, maxHeight: 0, boundHit: false, boundReason: '', error: true }
-      }
+      // Graceful: a prepass error is logged inside runScrollPrepass and returned as
+      // an error-tagged diag; the capture continues with the state reached.
+      scrollDiag = await runScrollPrepass(playwrightScrollPage(page), {
+        stepRatio: FULLPAGE_SCROLL_STEP_RATIO,
+        stepWaitMs: FULLPAGE_SCROLL_STEP_WAIT_MS,
+        maxSteps: FULLPAGE_SCROLL_MAX_STEPS,
+        maxMs: FULLPAGE_SCROLL_MAX_MS,
+        maxHeightPx: FULLPAGE_SCROLL_MAX_HEIGHT_PX,
+      })
       // Optional short final settle so the last-revealed section / images finish.
       if (FULLPAGE_SCROLL_FINAL_SETTLE_MS > 0) await page.waitForTimeout(FULLPAGE_SCROLL_FINAL_SETTLE_MS).catch(() => {})
       timings.fullPageScrollMs        = scrollDiag.ms
