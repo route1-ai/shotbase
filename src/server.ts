@@ -444,7 +444,8 @@ type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
       renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string
       timings?: Record<string, number>; fallbackUsed?: boolean
-      scrollDiag?: (ScrollDiag & { error?: boolean }) }
+      scrollDiag?: (ScrollDiag & { error?: boolean })
+      fixedOverlay?: { detected: boolean; height: number; composited: boolean; ms: number } }
   | { ok: false; kind: 'ssrf' | 'capture' | 'overloaded'; message: string; retryAfterMs?: number }
 
 // ─── Bounded navigation strategy (render reliability) ────────────────────────────
@@ -490,10 +491,87 @@ const FULLPAGE_SCROLL_MAX_MS          = envInt('FULLPAGE_SCROLL_MAX_MS', 7_000, 
 const FULLPAGE_SCROLL_MAX_HEIGHT_PX   = envInt('FULLPAGE_SCROLL_MAX_HEIGHT_PX', 40_000, 2_000, 200_000)
 const FULLPAGE_SCROLL_FINAL_SETTLE_MS = envInt('FULLPAGE_SCROLL_FINAL_SETTLE_MS', 250, 0, 5_000)
 
-// Cache version — bump when rendered output changes so a stale (pre-fix, blank)
-// full-page image can't be served from cache after rollout. TTL is only 60s, so
-// this just closes the brief post-rollout window; it invalidates every key once.
-const CAPTURE_CACHE_VERSION = 'v2-fpscroll'
+// ─── Fixed/sticky top-element preservation (full-page image captures) ─────────────
+// Playwright paints position:fixed/sticky elements at the CURRENT scroll offset, so
+// the leave-at-bottom full-page prepass drops the top navbar from y=0 (and could
+// leave a stray copy mid-page). Generic fix: BEFORE the prepass (page at top) detect
+// top-anchored fixed/sticky elements and snapshot that top strip once; hide ONLY
+// those elements during the full-page shot (so nothing is duplicated); composite the
+// strip back at y=0. No scroll-back-to-top (avoids the reverse/scrub blank
+// regression); no permanent DOM mutation (visibility is toggled then fully restored).
+const FULLPAGE_FIXED_OVERLAY_ENABLED = envBool('FULLPAGE_FIXED_OVERLAY_ENABLED', true)
+// Ceiling on the overlay strip height (px). Also the max height a fixed/sticky
+// element may occupy to still count as a "header" — taller ones (modals, hero
+// overlays) are ignored so we never composite a full-screen layer as a navbar.
+const FULLPAGE_FIXED_OVERLAY_MAX_PX  = envInt('FULLPAGE_FIXED_OVERLAY_MAX_PX', 240, 40, 2_000)
+
+// Cache version — bump when rendered output changes so a stale (pre-fix) image
+// (blank sections, or a navbar-missing full page) can't be served from cache after
+// rollout. TTL is only 60s, so this just closes the brief post-rollout window; it
+// invalidates every key once.
+const CAPTURE_CACHE_VERSION = 'v3-fixedoverlay'
+
+// ── Generic fixed/sticky detection + hide/restore (run in the page via evaluate) ──
+// Conservative + generic: NO tag/class/id/hostname/text heuristics. An element
+// qualifies only if it is computed position fixed|sticky, visible, wide (header-like),
+// not too tall, and anchored to the TOP of the viewport (so bottom chat widgets /
+// cookie bars are excluded). Matched elements are marked with data-sb-fixed (storing
+// their original inline visibility) so hide/restore can find them deterministically.
+export const DETECT_FIXED = (cap: number): { overlayHeight: number; count: number } => {
+  const vw = window.innerWidth, vh = window.innerHeight
+  let maxBottom = 0, count = 0
+  const all = document.querySelectorAll('body *')
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i] as HTMLElement
+    const cs = getComputedStyle(el)
+    if (cs.position !== 'fixed' && cs.position !== 'sticky') continue
+    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity || '1') < 0.1) continue
+    const r = el.getBoundingClientRect()
+    if (r.width < vw * 0.3) continue            // must span a header-like width
+    if (r.height < 8 || r.height > vh * 0.5) continue
+    if (r.top > vh * 0.25) continue             // top-anchored only (excludes bottom widgets)
+    if (r.bottom <= 0 || r.bottom > cap) continue // within the header band; skip tall overlays
+    el.setAttribute('data-sb-fixed', el.style.visibility || '__empty__')
+    if (r.bottom > maxBottom) maxBottom = r.bottom
+    count++
+  }
+  return { overlayHeight: Math.min(Math.ceil(maxBottom), cap), count }
+}
+export const HIDE_FIXED = (): void => {
+  const els = document.querySelectorAll('[data-sb-fixed]')
+  for (let i = 0; i < els.length; i++) (els[i] as HTMLElement).style.visibility = 'hidden'
+}
+export const RESTORE_FIXED = (): void => {
+  const els = document.querySelectorAll('[data-sb-fixed]')
+  for (let i = 0; i < els.length; i++) {
+    const el = els[i] as HTMLElement
+    const orig = el.getAttribute('data-sb-fixed')
+    el.style.visibility = (orig === '__empty__' || orig === null) ? '' : orig
+    el.removeAttribute('data-sb-fixed')
+  }
+}
+
+// Error-safe orchestration for the hide → full-page shot → restore → composite flow.
+// Restoration ALWAYS runs (finally) even if the screenshot throws, so a capture-time
+// failure never leaves the page mutated; the throw propagates so the outer handler
+// releases the BrowserGate permit and reports the failure. Injectable ops make this
+// unit-testable without a browser.
+export interface FixedOverlayOps {
+  hide: () => Promise<void>
+  screenshotPng: () => Promise<Buffer>
+  restore: () => Promise<void>
+  composite: (base: Buffer) => Promise<Buffer>
+}
+export async function screenshotWithFixedOverlay(ops: FixedOverlayOps): Promise<Buffer> {
+  await ops.hide()
+  let base: Buffer
+  try {
+    base = await ops.screenshotPng()
+  } finally {
+    await ops.restore()
+  }
+  return ops.composite(base)
+}
 
 // A minimal page surface the prepass needs — lets it be unit-tested with a mock
 // (real captures can't target a local test server: the SSRF guard blocks private IPs).
@@ -677,6 +755,31 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       return { ok: false, kind: 'capture', message: 'Navigation completed but page produced no content' }
     }
 
+    // ── Fixed/sticky top-element overlay: DETECT + SNAPSHOT (page still at top) ──
+    // Runs BEFORE the prepass while scrollY≈0, so the navbar is captured exactly as
+    // a first-time visitor sees it. Only full-page image captures; failures are
+    // non-fatal (skip the overlay, fall back to the plain full-page shot).
+    let fixedOverlay: Buffer | null = null
+    let fixedOverlayDetected = false
+    let fixedOverlayHeight = 0
+    let fixedOverlayMs = 0
+    const wantFixedOverlay = fullPage && format !== 'pdf' && FULLPAGE_SCROLL_ENABLED && FULLPAGE_FIXED_OVERLAY_ENABLED
+    if (wantFixedOverlay) {
+      const tFix = Date.now()
+      try {
+        const det = await page.evaluate(DETECT_FIXED, FULLPAGE_FIXED_OVERLAY_MAX_PX)
+        fixedOverlayDetected = det.count > 0
+        fixedOverlayHeight = det.overlayHeight
+        if (det.count > 0 && det.overlayHeight > 0) {
+          fixedOverlay = Buffer.from(await page.screenshot({ clip: { x: 0, y: 0, width, height: det.overlayHeight } }))
+        }
+      } catch (err) {
+        console.error('Fixed-overlay detect/capture error (skipping overlay):', err instanceof Error ? err.message : 'unknown')
+        fixedOverlay = null
+      }
+      fixedOverlayMs = Date.now() - tFix
+    }
+
     // ── Bounded full-page scroll prepass ──────────────────────────────────────
     // Only for full-page IMAGE captures (png/jpeg/webp): traverse the viewport so
     // lazy/IntersectionObserver/GSAP-reveal content initializes BEFORE capture.
@@ -723,9 +826,31 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     const tShot = Date.now()
     let buffer: Buffer
     let contentType: string
+    let fixedOverlayComposited = false
     if (format === 'pdf') {
       buffer = Buffer.from(await page.pdf({ format: 'A4', printBackground: true }))
       contentType = 'application/pdf'
+    } else if (fixedOverlay) {
+      // Full-page image with a captured top overlay: hide the detected fixed/sticky
+      // elements for the shot (no stray/duplicate copy at the bottom), take the
+      // full-page PNG, restore, then composite the overlay strip back at y=0. Both
+      // images are the same width at DPR 1, so the composite aligns pixel-for-pixel.
+      const overlay = fixedOverlay
+      const tFixComposite = Date.now()
+      buffer = await screenshotWithFixedOverlay({
+        hide: () => page.evaluate(HIDE_FIXED),
+        screenshotPng: async () => Buffer.from(await page.screenshot({ type: 'png', fullPage: true })),
+        restore: () => page.evaluate(RESTORE_FIXED),
+        composite: async (base) => {
+          const img = sharp(base).composite([{ input: overlay, top: 0, left: 0 }])
+          if (format === 'jpeg') return img.jpeg({ quality: 80 }).toBuffer()
+          if (format === 'webp') return img.webp().toBuffer()
+          return img.png().toBuffer()
+        },
+      })
+      contentType = getContentType(format)
+      fixedOverlayComposited = true
+      fixedOverlayMs += Date.now() - tFixComposite
     } else if (format === 'jpeg') {
       buffer = Buffer.from(await page.screenshot({ type: 'jpeg', quality: 80, fullPage }))
       contentType = 'image/jpeg'
@@ -738,6 +863,14 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       contentType = 'image/png'
     }
     mark('screenshotMs', tShot)
+    // Fixed-overlay observability (internal; additive timings + narrow header/JSON).
+    if (wantFixedOverlay) {
+      timings.fixedOverlayDetected   = fixedOverlayDetected ? 1 : 0
+      timings.fixedOverlayHeight     = fixedOverlayHeight
+      timings.fixedOverlayComposited = fixedOverlayComposited ? 1 : 0
+      timings.fixedOverlayMs         = fixedOverlayMs
+      console.log(`[fixedoverlay] detected=${fixedOverlayDetected} height=${fixedOverlayHeight} composited=${fixedOverlayComposited} ms=${fixedOverlayMs}`)
+    }
 
     // AI extraction — a Bedrock failure is reported via aiError; the image stays valid.
     const tBedrock = Date.now()
@@ -778,7 +911,8 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     }
     logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false, aiRequested, aiSucceeded })
 
-    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed, scrollDiag }
+    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed, scrollDiag,
+      fixedOverlay: wantFixedOverlay ? { detected: fixedOverlayDetected, height: fixedOverlayHeight, composited: fixedOverlayComposited, ms: fixedOverlayMs } : undefined }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     console.error('Screenshot error:', msg)
@@ -1112,6 +1246,11 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     imgHeaders['X-FullPage-Initial-Height'] = String(r.scrollDiag.initialHeight)
     imgHeaders['X-FullPage-Max-Height']    = String(r.scrollDiag.maxHeight)
     imgHeaders['X-FullPage-Bound-Hit']     = String(r.scrollDiag.boundHit)
+  }
+  if (r.fixedOverlay) {
+    imgHeaders['X-FullPage-Fixed-Detected']   = String(r.fixedOverlay.detected)
+    imgHeaders['X-FullPage-Fixed-Height']     = String(r.fixedOverlay.height)
+    imgHeaders['X-FullPage-Fixed-Composited'] = String(r.fixedOverlay.composited)
   }
   return c.body(new Uint8Array(r.buffer), 200, imgHeaders)
 })

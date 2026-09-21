@@ -66,7 +66,11 @@ async function shotJson(base, uid, extra) {
 async function shotImg(base, uid, extra) {
   const r = await fetch(`${base}/screenshot`, { method: 'POST', headers: hdr(uid), body: JSON.stringify({ url: URL_, ...extra }), signal: AbortSignal.timeout(60000) })
   const buf = Buffer.from(await r.arrayBuffer())
-  return { status: r.status, ct: r.headers.get('content-type'), bytes: buf.length, steps: r.headers.get('x-fullpage-scroll-steps'), initH: r.headers.get('x-fullpage-initial-height') }
+  return {
+    status: r.status, ct: r.headers.get('content-type'), bytes: buf.length,
+    steps: r.headers.get('x-fullpage-scroll-steps'), initH: r.headers.get('x-fullpage-initial-height'),
+    fixedDetected: r.headers.get('x-fullpage-fixed-detected'), fixedComposited: r.headers.get('x-fullpage-fixed-composited'),
+  }
 }
 async function waitUp(base) {
   for (let i = 0; i < 40; i++) { try { const h = await fetch(`${base}/health`); if (h.ok && (await h.json()).supabase === true) return true } catch {} await sleep(500) }
@@ -93,11 +97,14 @@ try {
 
   // 8) viewport image unchanged + header wiring
   const imgOff = await shotImg(B, 'user_imgoff', { full_page: false, width: 820, height: 600 })
-  assert(imgOff.status === 200 && imgOff.ct?.startsWith('image/') && imgOff.bytes > 1000 && imgOff.steps === null,
-    `viewport (full_page=false) → 200 image, no X-FullPage headers (bytes=${imgOff.bytes}, steps hdr=${imgOff.steps})`)
+  assert(imgOff.status === 200 && imgOff.ct?.startsWith('image/') && imgOff.bytes > 1000 && imgOff.steps === null && imgOff.fixedDetected === null,
+    `viewport (full_page=false) → 200 image, NO X-FullPage headers incl. fixed (steps=${imgOff.steps}, fixed=${imgOff.fixedDetected})`)
   const imgOn = await shotImg(B, 'user_imgon', { full_page: true, width: 821, height: 600 })
   assert(imgOn.status === 200 && imgOn.ct?.startsWith('image/') && imgOn.steps !== null,
     `full_page=true image → 200 with X-FullPage-Scroll-Steps header (=${imgOn.steps}, initH=${imgOn.initH})`)
+  // example.com has NO fixed/sticky header → detection runs but finds nothing, no composite (page unchanged).
+  assert(imgOn.fixedDetected === 'false' && imgOn.fixedComposited === 'false',
+    `no-fixed page → fixed overlay detected=false, composited=false (unchanged output) (detected=${imgOn.fixedDetected}, composited=${imgOn.fixedComposited})`)
 
   // 10) exactly one log row per successful capture
   const before = rows.filter((r) => r.user_id === 'user_count').length

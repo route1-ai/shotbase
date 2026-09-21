@@ -1,0 +1,34 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  * { margin:0; box-sizing:border-box; }
+  body { font-family: sans-serif; }
+  #fixedHeader { position:fixed; top:0; left:0; width:100%; height:60px; background:#e11d1d; color:#fff;
+    display:flex; align-items:center; justify-content:center; font-size:24px; z-index:1000; }
+  #stickyBar { position:sticky; top:60px; height:40px; background:#f59e0b; color:#000;
+    display:flex; align-items:center; justify-content:center; z-index:900; }
+  .spacer { height:100px; }
+  section { height:600px; display:flex; align-items:center; justify-content:center; font-size:40px; color:#fff; }
+  #s1 { background:#1e3a8a; } #s2 { background:#166534; } #s3 { background:#7c2d12; }
+  #reveal { background:#111; color:#fff; opacity:0; transition:opacity .15s; } /* play-once reveal */
+  #lazy { background:#374151; color:#fff; } #lazy.loaded { background:#16a34a; }
+  #tail1 { background:#334155; } #tail2 { background:#4c1d95; } #footer { background:#0a0a0a; color:#0f0; }
+  #chat { position:fixed; bottom:20px; right:20px; width:70px; height:70px; border-radius:50%;
+    background:#2563eb; color:#fff; display:flex; align-items:center; justify-content:center; font-size:11px; z-index:1000; }
+</style></head><body>
+  <div id="fixedHeader">FIXEDHEADER</div>
+  <div class="spacer"></div>
+  <div id="stickyBar">STICKYBAR</div>
+  <section id="s1">S1 hero</section>
+  <section id="reveal">REVEAL (play-once on enter)</section>
+  <section id="s2">S2</section>
+  <section id="lazy">LAZY (gray to green on view)</section>
+  <section id="s3">S3</section>
+  <section id="tail1">TAIL1</section>
+  <section id="tail2">TAIL2</section>
+  <section id="footer">FOOTER-BOTTOM</section>
+  <div id="chat">CHATWIDGET</div>
+  <script>
+    // lazy + reveal: play-once (turn on when first seen, stay on — typical native/IO lazy)
+    new IntersectionObserver((es,o)=>{es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('loaded');o.unobserve(e.target);}});}).observe(document.getElementById('lazy'));
+    new IntersectionObserver((es,o)=>{es.forEach(e=>{if(e.isIntersecting){e.target.style.opacity='1';o.unobserve(e.target);}});}).observe(document.getElementById('reveal'));
+  </script>
+</body></html>
