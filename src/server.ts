@@ -443,7 +443,8 @@ interface CaptureOpts {
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
       renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string
-      timings?: Record<string, number>; fallbackUsed?: boolean }
+      timings?: Record<string, number>; fallbackUsed?: boolean
+      scrollDiag?: (ScrollDiag & { error?: boolean }) }
   | { ok: false; kind: 'ssrf' | 'capture' | 'overloaded'; message: string; retryAfterMs?: number }
 
 // ─── Bounded navigation strategy (render reliability) ────────────────────────────
@@ -455,6 +456,118 @@ type CaptureResult =
 const NAV_TIMEOUT_MS         = Math.max(1000, Math.floor(Number(process.env.NAV_TIMEOUT_MS ?? 30_000)) || 30_000)
 const NAV_IDLE_MS            = Math.max(0, Math.floor(Number(process.env.NAV_IDLE_MS ?? 4_000)) || 4_000)
 const NAV_SETTLE_FALLBACK_MS = Math.max(0, Math.floor(Number(process.env.NAV_SETTLE_FALLBACK_MS ?? 750)) || 750)
+
+// ─── Bounded env parsing helpers (safe: NaN/out-of-range → clamped default) ───────
+function envInt(name: string, def: number, min: number, max: number): number {
+  const v = Math.floor(Number(process.env[name] ?? def))
+  if (!Number.isFinite(v)) return def
+  return Math.min(max, Math.max(min, v))
+}
+function envFloat(name: string, def: number, min: number, max: number): number {
+  const v = Number(process.env[name] ?? def)
+  if (!Number.isFinite(v)) return def
+  return Math.min(max, Math.max(min, v))
+}
+function envBool(name: string, def: boolean): boolean {
+  const v = process.env[name]
+  if (v === undefined || v === '') return def
+  const s = v.trim().toLowerCase()
+  return s === 'true' || s === '1' || s === 'yes'
+}
+
+// ─── Bounded full-page scroll prepass (render reliability for lazy/scroll content) ─
+// Playwright's fullPage screenshot renders the whole document in one shot but does
+// NOT traverse it first, so lazy images, IntersectionObserver content, and GSAP/
+// ScrollTrigger reveals never fire → a full-height image with blank sections.
+// For fullPage image captures we first walk the viewport downward in bounded steps
+// (like a real user) so that content initializes BEFORE capture. Every knob is
+// bounded so a pathological/infinite-feed page terminates deterministically.
+const FULLPAGE_SCROLL_ENABLED         = envBool('FULLPAGE_SCROLL_ENABLED', true)
+const FULLPAGE_SCROLL_STEP_RATIO      = envFloat('FULLPAGE_SCROLL_STEP_RATIO', 0.85, 0.1, 1.0)
+const FULLPAGE_SCROLL_STEP_WAIT_MS    = envInt('FULLPAGE_SCROLL_STEP_WAIT_MS', 150, 0, 2_000)
+const FULLPAGE_SCROLL_MAX_STEPS       = envInt('FULLPAGE_SCROLL_MAX_STEPS', 50, 1, 500)
+const FULLPAGE_SCROLL_MAX_MS          = envInt('FULLPAGE_SCROLL_MAX_MS', 7_000, 500, 30_000)
+const FULLPAGE_SCROLL_MAX_HEIGHT_PX   = envInt('FULLPAGE_SCROLL_MAX_HEIGHT_PX', 40_000, 2_000, 200_000)
+const FULLPAGE_SCROLL_FINAL_SETTLE_MS = envInt('FULLPAGE_SCROLL_FINAL_SETTLE_MS', 250, 0, 5_000)
+// Test-only lever (default OFF): force the prepass to throw so tests can prove the
+// capture degrades gracefully AND the BrowserGate permit is still released.
+const FULLPAGE_SCROLL_FORCE_ERROR     = envBool('FULLPAGE_SCROLL_FORCE_ERROR', false)
+
+// Cache version — bump when rendered output changes so a stale (pre-fix, blank)
+// full-page image can't be served from cache after rollout. TTL is only 60s, so
+// this just closes the brief post-rollout window; it invalidates every key once.
+const CAPTURE_CACHE_VERSION = 'v2-fpscroll'
+
+// A minimal page surface the prepass needs — lets it be unit-tested with a mock
+// (real captures can't target a local test server: the SSRF guard blocks private IPs).
+export interface ScrollPage {
+  metrics(): Promise<{ scrollY: number; viewportHeight: number; scrollHeight: number }>
+  scrollTo(y: number): Promise<void>
+  wait(ms: number): Promise<void>
+}
+export interface ScrollPrepassOpts {
+  stepRatio: number
+  stepWaitMs: number
+  maxSteps: number
+  maxMs: number
+  maxHeightPx: number
+  now?: () => number
+}
+export interface ScrollDiag {
+  ms: number
+  steps: number
+  initialHeight: number
+  maxHeight: number
+  boundHit: boolean
+  boundReason: string
+}
+// Bounded downward traversal. Stops at the true bottom OR the first safety bound.
+// Re-reads height each step so lazy/growing content is followed — but only within
+// the bounds, so an infinite feed terminates. Never scrolls back up (see prepass
+// call site: reverse-on-scroll reveals must not be un-triggered before capture).
+export async function scrollPrepass(page: ScrollPage, opts: ScrollPrepassOpts): Promise<ScrollDiag> {
+  const now = opts.now ?? Date.now
+  const start = now()
+  const first = await page.metrics()
+  const initialHeight = first.scrollHeight
+  let maxHeight = initialHeight
+  const step = Math.max(1, Math.round(first.viewportHeight * opts.stepRatio))
+  let steps = 0
+  let boundHit = false
+  let boundReason = ''
+  let m = first
+  while (true) {
+    if (m.scrollHeight > maxHeight) maxHeight = m.scrollHeight
+    // Reached the bottom of the (current) document → done, not a bound.
+    if (m.scrollY + m.viewportHeight >= m.scrollHeight - 2) break
+    // Safety bounds — any one terminates the traversal deterministically.
+    if (steps >= opts.maxSteps)        { boundHit = true; boundReason = 'max_steps';  break }
+    if (now() - start >= opts.maxMs)   { boundHit = true; boundReason = 'max_ms';     break }
+    if (m.scrollHeight >= opts.maxHeightPx) { boundHit = true; boundReason = 'max_height'; break }
+    const target = Math.min(m.scrollY + step, opts.maxHeightPx)
+    await page.scrollTo(target)
+    steps++
+    if (opts.stepWaitMs > 0) await page.wait(opts.stepWaitMs)
+    m = await page.metrics()
+  }
+  return { ms: now() - start, steps, initialHeight, maxHeight, boundHit, boundReason }
+}
+
+// Adapter: drive a real Playwright page through the ScrollPage surface.
+function playwrightScrollPage(page: { evaluate: Function; waitForTimeout: Function }): ScrollPage {
+  return {
+    metrics: () => page.evaluate(() => ({
+      scrollY: Math.round(window.scrollY || window.pageYOffset || 0),
+      viewportHeight: window.innerHeight,
+      scrollHeight: Math.max(
+        document.documentElement?.scrollHeight ?? 0,
+        document.body?.scrollHeight ?? 0,
+      ),
+    })) as Promise<{ scrollY: number; viewportHeight: number; scrollHeight: number }>,
+    scrollTo: (y: number) => page.evaluate((yy: number) => window.scrollTo(0, yy), y) as Promise<void>,
+    wait: (ms: number) => page.waitForTimeout(ms) as Promise<void>,
+  }
+}
 
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
@@ -475,7 +588,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   // Key MUST include every render-affecting parameter — width/height changed the
   // pixels but were previously omitted, so a 320-wide and a 1440-wide capture of
   // the same URL collided and served the wrong image.
-  const cacheKey = `cache:${url}:${format}:${fullPage}:${width}x${height}`
+  const cacheKey = `cache:${CAPTURE_CACHE_VERSION}:${url}:${format}:${fullPage}:${width}x${height}`
   const now = Date.now()
   if (!includeText && !aiExtract) {
     if (redis) {
@@ -547,6 +660,42 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       return { ok: false, kind: 'capture', message: 'Navigation completed but page produced no content' }
     }
 
+    // ── Bounded full-page scroll prepass ──────────────────────────────────────
+    // Only for full-page IMAGE captures (png/jpeg/webp): traverse the viewport so
+    // lazy/IntersectionObserver/GSAP-reveal content initializes BEFORE capture.
+    // Scoped out of PDF on purpose — page.pdf() ignores fullPage, so running it
+    // there would silently redefine the PDF contract (see report). We leave the
+    // page at the position reached (never scroll back to top) because reverse-on-
+    // scroll reveals would otherwise un-trigger before the screenshot. A prepass
+    // error degrades gracefully: log it and still capture the state reached.
+    let scrollDiag: (ScrollDiag & { error?: boolean }) | undefined
+    if (fullPage && FULLPAGE_SCROLL_ENABLED && format !== 'pdf') {
+      const tScroll = Date.now()
+      try {
+        if (FULLPAGE_SCROLL_FORCE_ERROR) throw new Error('forced scroll prepass error (test lever)')
+        scrollDiag = await scrollPrepass(playwrightScrollPage(page), {
+          stepRatio: FULLPAGE_SCROLL_STEP_RATIO,
+          stepWaitMs: FULLPAGE_SCROLL_STEP_WAIT_MS,
+          maxSteps: FULLPAGE_SCROLL_MAX_STEPS,
+          maxMs: FULLPAGE_SCROLL_MAX_MS,
+          maxHeightPx: FULLPAGE_SCROLL_MAX_HEIGHT_PX,
+        })
+      } catch (err) {
+        console.error('Scroll prepass error (continuing to capture):', err instanceof Error ? err.message : 'unknown')
+        scrollDiag = { ms: Date.now() - tScroll, steps: 0, initialHeight: 0, maxHeight: 0, boundHit: false, boundReason: '', error: true }
+      }
+      // Optional short final settle so the last-revealed section / images finish.
+      if (FULLPAGE_SCROLL_FINAL_SETTLE_MS > 0) await page.waitForTimeout(FULLPAGE_SCROLL_FINAL_SETTLE_MS).catch(() => {})
+      timings.fullPageScrollMs        = scrollDiag.ms
+      timings.fullPageScrollSteps     = scrollDiag.steps
+      timings.fullPageInitialHeight   = scrollDiag.initialHeight
+      timings.fullPageMaxHeight       = scrollDiag.maxHeight
+      timings.fullPageScrollBoundHit  = scrollDiag.boundHit ? 1 : 0
+      if (scrollDiag.error) timings.fullPageScrollError = 1
+      console.log(`[fullpage] steps=${scrollDiag.steps} initH=${scrollDiag.initialHeight} maxH=${scrollDiag.maxHeight} boundHit=${scrollDiag.boundHit}${scrollDiag.boundReason ? '(' + scrollDiag.boundReason + ')' : ''} ms=${scrollDiag.ms}${scrollDiag.error ? ' error=1' : ''}`)
+    }
+
+    // Text extraction runs AFTER the prepass so lazy-inserted text is included.
     const tText = Date.now()
     let pageText: string | null = null
     if (includeText || aiRequested) {
@@ -617,7 +766,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     }
     logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false, aiRequested, aiSucceeded })
 
-    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed }
+    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed, scrollDiag }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     console.error('Screenshot error:', msg)
@@ -935,9 +1084,24 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     })
   }
 
-  return c.body(new Uint8Array(r.buffer), 200, r.cached
-    ? { 'Content-Type': r.contentType, 'X-Cache': 'HIT' }
-    : { 'Content-Type': r.contentType, 'X-Cache': 'MISS', 'X-Render-Time': String(r.renderTime), 'X-Nav-Fallback': String(r.fallbackUsed ?? false) })
+  if (r.cached) {
+    return c.body(new Uint8Array(r.buffer), 200, { 'Content-Type': r.contentType, 'X-Cache': 'HIT' })
+  }
+  const imgHeaders: Record<string, string> = {
+    'Content-Type': r.contentType,
+    'X-Cache': 'MISS',
+    'X-Render-Time': String(r.renderTime),
+    'X-Nav-Fallback': String(r.fallbackUsed ?? false),
+  }
+  // Additive full-page scroll diagnostics (only present when the prepass ran).
+  if (r.scrollDiag) {
+    imgHeaders['X-FullPage-Scroll-Steps']  = String(r.scrollDiag.steps)
+    imgHeaders['X-FullPage-Scroll-Ms']     = String(r.scrollDiag.ms)
+    imgHeaders['X-FullPage-Initial-Height'] = String(r.scrollDiag.initialHeight)
+    imgHeaders['X-FullPage-Max-Height']    = String(r.scrollDiag.maxHeight)
+    imgHeaders['X-FullPage-Bound-Hit']     = String(r.scrollDiag.boundHit)
+  }
+  return c.body(new Uint8Array(r.buffer), 200, imgHeaders)
 })
 
 // ─── MCP Server (Stage 2 — streamable HTTP, JSON-RPC 2.0 at POST /api/mcp) ─────
