@@ -74,8 +74,11 @@ if (!haveRealAws) {
 
 // ── Cases 2–4: invalid AWS creds → deterministic extraction failure ──────────
 await withServer({ ...BASE_ENV, ...INVALID_AWS, PORT: '3952' }, async (B) => {
+  // Bedrock client is initialized from the (invalid) AWS creds; /health no longer
+  // exposes a bedrock flag (it must never call Bedrock), so we verify the failure
+  // behavior directly via the responses below rather than a health precondition.
   const h = await (await fetch(`${B}/health`)).json()
-  assert(h.bedrock === true, `bedrock client initialized for failure path (health.bedrock=${h.bedrock})`)
+  assert(h.status === 'ok', `server healthy for failure-path cases (status=${h.status})`)
 
   console.log('— Case 2: render OK + extraction FAIL → graceful 200 —')
   const r2 = await post(B, '/screenshot', { url: GOOD_URL, include_text: true, ai_extract: { page_type: true, headings: true, ctas: true, prices: true } })

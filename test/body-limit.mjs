@@ -64,6 +64,34 @@ try {
   const mcpBody = await mcpBig.json().catch(() => ({}))
   assert(mcpBig.status === 413 && mcpBody?.error?.code === -32600, `MCP oversized → 413 JSON-RPC error (got ${mcpBig.status} ${JSON.stringify(mcpBody?.error)})`)
 
+  // Oversized CHUNKED body with NO Content-Length must still be rejected (413).
+  // Older hono's bodyLimit only checked Content-Length, so a streamed/chunked body
+  // could skip the cap entirely — this is the regression the hono update fixes.
+  // A ReadableStream body is sent by undici as Transfer-Encoding: chunked.
+  function chunkedBody(totalBytes) {
+    const chunk = new TextEncoder().encode('a'.repeat(16 * 1024))
+    let sent = 0
+    return new ReadableStream({
+      pull(controller) {
+        if (sent >= totalBytes) { controller.close(); return }
+        controller.enqueue(chunk); sent += chunk.length
+      },
+    })
+  }
+  let chunkedStatus = 0
+  try {
+    const r = await fetch(`${B}/screenshot`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${BYPASS}`, 'Content-Type': 'application/json', 'X-Shotbase-User-Id': 'user_body' },
+      body: chunkedBody(LIMIT * 8), duplex: 'half', signal: AbortSignal.timeout(15000),
+    })
+    chunkedStatus = r.status
+  } catch (err) {
+    // A hard cap can also surface as the server closing the connection mid-stream.
+    chunkedStatus = /terminated|aborted|socket|reset|body/i.test(String(err)) ? 413 : -1
+  }
+  assert(chunkedStatus === 413, `oversized chunked body (no Content-Length) → 413 (got ${chunkedStatus})`)
+
   // /health stays responsive right after the oversized burst
   const t0 = Date.now()
   const h = await fetch(`${B}/health`)

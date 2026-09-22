@@ -11,12 +11,12 @@
     "@aws-sdk/client-bedrock": "^3.1037.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1037.0",
     "@ghostery/adblocker-playwright": "^2.18.2",
-    "@hono/node-server": "^1.19.0",
+    "@hono/node-server": "^2.1.1",
     "@supabase/supabase-js": "^2.49.0",
-    "hono": "^4.9.0",
+    "hono": "^4.13.8",
     "ioredis": "^5.10.1",
     "playwright": "^1.55.0",
-    "sharp": "^0.34.5"
+    "sharp": "^0.35.4"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

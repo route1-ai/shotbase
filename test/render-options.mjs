@@ -9,7 +9,12 @@
 import { spawn } from 'node:child_process'
 import sharp from 'sharp'
 
-const KEY = process.env.SB_KEY || 'devkey'
+// This suite fires many requests; the rate limiter now runs BEFORE validation (a
+// flood of even-invalid requests is throttled), so give each request its own dev
+// key (all free plan) to keep the free 10 rpm limit from masking the behavior.
+const KEYS = Array.from({ length: 60 }, (_, i) => `dk${i}`)
+let keyN = 0
+const nextKey = () => KEYS[keyN++ % KEYS.length]
 const URL_ = process.env.SB_URL ?? 'https://example.com'
 const PORT = 3991
 
@@ -20,15 +25,15 @@ const assert = (c, m) => (c ? ok(m) : bad(m))
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 const child = spawn('node', ['dist/server.js'], {
-  env: { ...process.env, PORT: String(PORT), API_KEYS: KEY, UNKEY_ROOT_KEY: '', PLAYGROUND_BYPASS_KEY: '', SUPABASE_URL: '', REDIS_URL: '' },
+  env: { ...process.env, PORT: String(PORT), API_KEYS: KEYS.join(','), UNKEY_ROOT_KEY: '', PLAYGROUND_BYPASS_KEY: '', SUPABASE_URL: '', REDIS_URL: '' },
   stdio: ['ignore', 'ignore', 'inherit'],
 })
 function cleanup() { try { child.kill('SIGKILL') } catch {} }
 process.on('exit', cleanup)
 
-const H = { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' }
+const hdr = () => ({ Authorization: `Bearer ${nextKey()}`, 'Content-Type': 'application/json' })
 async function post(body) {
-  const r = await fetch(`http://localhost:${PORT}/screenshot`, { method: 'POST', headers: H, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) })
+  const r = await fetch(`http://localhost:${PORT}/screenshot`, { method: 'POST', headers: hdr(), body: JSON.stringify(body), signal: AbortSignal.timeout(60000) })
   const ct = r.headers.get('content-type') || ''
   const buf = Buffer.from(await r.arrayBuffer())
   const json = ct.includes('application/json') ? JSON.parse(buf.toString()) : null
@@ -79,7 +84,7 @@ try {
   assert(data2.status === 200 && data2.json.cached === true, `2nd include_text → data-cache hit (cached=${data2.json?.cached})`)
 
   // ── device_scale_factor scales the pixel dimensions ──
-  const dsfImg = await fetch(`http://localhost:${PORT}/screenshot`, { method: 'POST', headers: H, body: JSON.stringify({ url: URL_, width: 800, height: 600, device_scale_factor: 2 }) })
+  const dsfImg = await fetch(`http://localhost:${PORT}/screenshot`, { method: 'POST', headers: hdr(), body: JSON.stringify({ url: URL_, width: 800, height: 600, device_scale_factor: 2 }) })
   const dsfMeta = await sharp(Buffer.from(await dsfImg.arrayBuffer())).metadata()
   assert(dsfMeta.width === 1600 && dsfMeta.height >= 1200, `device_scale_factor=2 @800×600 → ${dsfMeta.width}×${dsfMeta.height} px`)
 

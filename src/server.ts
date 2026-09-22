@@ -8,6 +8,8 @@ import Redis from 'ioredis'
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { lookup } from 'node:dns/promises'
+import { readFileSync, existsSync } from 'node:fs'
+import path from 'node:path'
 
 const app = new Hono()
 
@@ -52,16 +54,27 @@ if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
 // Launch once on startup, create lightweight contexts per request
 // This eliminates the 2-4s browser cold-start per screenshot
 let browser: Browser | null = null
+let browserLaunch: Promise<Browser> | null = null
 
+// Concurrency-safe: dedupe overlapping launches (e.g. startup warmup + a /health
+// probe) so we never spin up two Chromium instances.
 async function getBrowser(): Promise<Browser> {
-  if (!browser || !browser.isConnected()) {
+  if (browser && browser.isConnected()) return browser
+  if (!browserLaunch) {
     console.log('Launching browser...')
-    browser = await chromium.launch({
+    browserLaunch = chromium.launch({
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    }).then((b) => {
+      browser = b
+      browserLaunch = null
+      console.log('✓ Browser ready')
+      return b
+    }).catch((err) => {
+      browserLaunch = null
+      throw err
     })
-    console.log('✓ Browser ready')
   }
-  return browser
+  return browserLaunch
 }
 
 // Warm up on startup (only when run as the entrypoint — not when imported by tests).
@@ -71,35 +84,48 @@ if (require.main === module) {
 
 // ─── Request-blocking engines (@ghostery/adblocker-playwright) ────────────────────
 // Two independent engines, each built ONCE at startup and enabled per-request only
-// when the caller asks (block_ads / remove_popups). If an engine fails to load
-// (e.g. no network at boot), it stays null and the capture proceeds WITHOUT blocking
-// — a blocker must never fail a request.
-//  • adBlocker    → prebuilt ads+tracking lists (the package offers fromPrebuiltAdsOnly
-//    / AdsAndTracking / Full; AdsAndTracking matches "ads and trackers").
-//  • popupBlocker → EasyList Cookie List + Fanboy's Annoyance List via fromLists
-//    (no cookie/annoyance-only prebuilt exists). These carry network + cosmetic rules
-//    that hide known cookie/consent banners; the DOM cleanup pass handles the rest.
+// when the caller asks (block_ads / remove_popups). Engines load from BUNDLED
+// serialized snapshots on disk (lists/*.bin — regenerate with
+// scripts/build-blocklists.mjs); the network is used ONLY as a fallback so a boot
+// with no network still works. A failed engine stays null and the capture proceeds
+// WITHOUT blocking — a blocker must never fail a request.
+//  • adBlocker    → ghostery prebuilt ads+tracking (lists/ads-and-tracking.bin).
+//  • popupBlocker → EasyList Cookie List + Fanboy's Annoyance List (lists/popups.bin).
 let adBlocker: PlaywrightBlocker | null = null
 let popupBlocker: PlaywrightBlocker | null = null
+const LISTS_DIR = path.join(__dirname, '..', 'lists')
 const POPUP_FILTER_LISTS = [
   'https://secure.fanboy.co.nz/fanboy-cookiemonster.txt', // EasyList Cookie List (Fanboy's Cookiemonster)
   'https://secure.fanboy.co.nz/fanboy-annoyance.txt',     // Fanboy's Annoyance List
 ]
+async function loadBlocker(
+  label: string,
+  snapshotFile: string,
+  fromNetwork: () => Promise<PlaywrightBlocker>,
+): Promise<PlaywrightBlocker | null> {
+  const snapshot = path.join(LISTS_DIR, snapshotFile)
+  try {
+    if (existsSync(snapshot)) {
+      const engine = PlaywrightBlocker.deserialize(new Uint8Array(readFileSync(snapshot)))
+      console.log(`✓ ${label} blocker: ready (bundled ${snapshotFile})`)
+      return engine
+    }
+    console.warn(`${label} blocker: bundled ${snapshotFile} missing — trying network`)
+  } catch (err) {
+    console.warn(`${label} blocker: bundled ${snapshotFile} unreadable (${err instanceof Error ? err.message : 'unknown'}) — trying network`)
+  }
+  try {
+    const engine = await fromNetwork()
+    console.log(`✓ ${label} blocker: ready (network fallback)`)
+    return engine
+  } catch (err) {
+    console.error(`✗ ${label} blocker: failed (${err instanceof Error ? err.message : 'unknown'}) — captures will not ${label === 'ad/tracker' ? 'block ads' : 'filter popups'}`)
+    return null
+  }
+}
 async function initBlockers(): Promise<void> {
-  try {
-    adBlocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch)
-    console.log('✓ Ad/tracker blocker ready')
-  } catch (err) {
-    console.error('Ad blocker engine failed to load (captures will not block ads):', err instanceof Error ? err.message : 'unknown')
-    adBlocker = null
-  }
-  try {
-    popupBlocker = await PlaywrightBlocker.fromLists(fetch, POPUP_FILTER_LISTS)
-    console.log('✓ Popup/cookie blocker ready')
-  } catch (err) {
-    console.error('Popup blocker engine failed to load (captures will not filter popups):', err instanceof Error ? err.message : 'unknown')
-    popupBlocker = null
-  }
+  adBlocker = await loadBlocker('ad/tracker', 'ads-and-tracking.bin', () => PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch))
+  popupBlocker = await loadBlocker('popup/cookie', 'popups.bin', () => PlaywrightBlocker.fromLists(fetch, POPUP_FILTER_LISTS))
 }
 if (require.main === module) {
   initBlockers().catch((err) => console.error('Blocker init failed:', err))
@@ -336,13 +362,17 @@ export function getAiExtractionQuota(plan: string): number {
 
 const inMemoryRateLimit = new Map<string, { count: number; reset: number }>()
 
-async function checkRateLimit(apiKey: string, plan: string): Promise<boolean> {
+// Rate limit is keyed on `bucketKey` — the API key for direct callers, or the
+// resolved user id for playground (bypass) callers, so one playground user cannot
+// exhaust the shared bypass key's bucket and lock out everyone else. Runs BEFORE any
+// Supabase query so a flood of rejected requests never reaches the database.
+async function checkRateLimit(bucketKey: string, plan: string): Promise<boolean> {
   const limit = getRateLimitPerMinute(plan)
   const now = Date.now()
 
   if (redis) {
     try {
-      const key = `ratelimit:${apiKey}`
+      const key = `ratelimit:${bucketKey}`
       const count = await redis.incr(key)
       if (count === 1) await redis.expire(key, 60)
       return count > limit
@@ -352,9 +382,9 @@ async function checkRateLimit(apiKey: string, plan: string): Promise<boolean> {
   }
 
   // In-memory fallback
-  const entry = inMemoryRateLimit.get(apiKey)
+  const entry = inMemoryRateLimit.get(bucketKey)
   if (!entry || now >= entry.reset) {
-    inMemoryRateLimit.set(apiKey, { count: 1, reset: now + 60_000 })
+    inMemoryRateLimit.set(bucketKey, { count: 1, reset: now + 60_000 })
     return false
   }
   if (entry.count >= limit) return true
@@ -734,8 +764,23 @@ export const REMOVE_POPUPS_SCRIPT = (): number => {
   const num = (v: string) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0 }
   const areaFrac = (r: DOMRect) => (Math.max(0, r.width) * Math.max(0, r.height)) / (vw * vh)
 
+  // Collect elements from the light DOM AND any OPEN shadow roots (recursively), so
+  // consent overlays that live inside web components (e.g. reddit) are reachable.
+  const collect = (root: ParentNode, out: HTMLElement[], depth: number): HTMLElement[] => {
+    if (depth > 8) return out
+    const els = root.querySelectorAll<HTMLElement>('*')
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i]
+      out.push(el)
+      const sr = el.shadowRoot // open shadow roots only (closed roots are inaccessible)
+      if (sr) collect(sr, out, depth + 1)
+    }
+    return out
+  }
+  const allEls = collect(document.body, [], 0)
+
   // Pass 1: fixed/sticky overlays and consent banners.
-  for (const el of Array.from(document.body.querySelectorAll<HTMLElement>('*'))) {
+  for (const el of allEls) {
     if (!el.isConnected) continue
     const cs = getComputedStyle(el)
     const pos = cs.position
@@ -764,7 +809,7 @@ export const REMOVE_POPUPS_SCRIPT = (): number => {
   }
 
   // Pass 2: full-screen backdrops/overlays (fixed, near-full-viewport, empty or semi-transparent).
-  for (const el of Array.from(document.body.querySelectorAll<HTMLElement>('*'))) {
+  for (const el of allEls) {
     if (!el.isConnected) continue
     const cs = getComputedStyle(el)
     if (cs.position !== 'fixed') continue
@@ -1292,18 +1337,58 @@ async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string, aiRequ
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-app.get('/health', (c) =>
-  c.json({
-    status: 'ok',
-    service: 'shotbase',
-    redis: !!redis,
-    supabase: !!supabase,
-    bedrock: !!bedrockClient,
-    browser: browser?.isConnected() ?? false,
-    browserActive: browserGate.activeCount,
-    browserQueued: browserGate.queuedCount,
-  })
-)
+// ─── Health check (honest, cached) ────────────────────────────────────────────
+// Public response is only { status, service }; per-subsystem detail is logged, not
+// exposed. Supabase (skipped if unconfigured) and the browser gate the status;
+// Redis is best-effort (we fall back to memory). Bedrock is NEVER probed (it costs
+// money per call). Result is cached HEALTH_CACHE_MS so healthcheck polling is cheap.
+const HEALTH_CACHE_MS = 10_000
+let healthCache: { at: number; ok: boolean } | null = null
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ])
+}
+async function computeHealth(): Promise<boolean> {
+  let ok = true
+  // Supabase — cheap connectivity query, 2s cap. Skipped when not configured (dev).
+  if (supabase) {
+    try {
+      const { error } = await withTimeout(
+        (async () => supabase!.from('screenshots').select('id', { head: true }).limit(1))(),
+        2_000, 'supabase',
+      )
+      if (error) throw new Error(error.message)
+    } catch (err) {
+      console.error('[health] supabase check failed → degraded:', err instanceof Error ? err.message : 'unknown')
+      ok = false
+    }
+  }
+  // Browser — if disconnected, try to (re)launch within a 10s cap. Failure → degraded.
+  if (!(browser?.isConnected() ?? false)) {
+    try {
+      await withTimeout(getBrowser(), 10_000, 'browser')
+    } catch (err) {
+      console.error('[health] browser launch failed → degraded:', err instanceof Error ? err.message : 'unknown')
+      ok = false
+    }
+  }
+  // Redis — 1s ping; a failure is logged but does NOT degrade (memory fallback).
+  if (redis) {
+    try { await withTimeout(redis.ping(), 1_000, 'redis') }
+    catch (err) { console.error('[health] redis ping failed (non-fatal, memory fallback):', err instanceof Error ? err.message : 'unknown') }
+  }
+  return ok
+}
+app.get('/health', async (c) => {
+  const now = Date.now()
+  if (!healthCache || now - healthCache.at >= HEALTH_CACHE_MS) {
+    healthCache = { at: now, ok: await computeHealth() }
+  }
+  const ok = healthCache.ok
+  return c.json({ status: ok ? 'ok' : 'degraded', service: 'shotbase' }, ok ? 200 : 503)
+})
 
 app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // ── Auth ──────────────────────────────────────────────────────────────────
@@ -1326,10 +1411,21 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   if (!owner.ok) return c.json({ error: owner.message }, 401)
   const ownerId = owner.ownerId
 
+  // ── Rate limit — BEFORE any Supabase query, so a flood never hits the database ──
+  // Bucket: the resolved user id for playground (bypass) callers (one user can't
+  // exhaust the shared bypass bucket), else the API key. RPM uses the key's own plan
+  // (Unkey meta for API keys; the bypass placeholder for playground) — the real
+  // plan needs a Supabase lookup, which is deferred to the monthly-quota check.
+  const rlPlan = normalizePlan(keyResult.plan)
+  const rlBucket = keyResult.viaBypass ? `user:${ownerId}` : `key:${apiKey}`
+  const tRate = Date.now()
+  const rateLimited = await checkRateLimit(rlBucket, rlPlan)
+  stage.rate_limit = Date.now() - tRate
+  if (rateLimited) {
+    return c.json({ error: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.` }, 429)
+  }
+
   // ── Parse body ──────────────────────────────────────────────────────────────
-  // Parsed before quota/rate so aiRequested is known (AI needs both quotas). The
-  // effective plan + monthly quota now resolve together (checkMonthlyQuota), which
-  // returns the plan the rate limiter uses.
   let body: Record<string, unknown> | null = null
   try { body = await c.req.json() } catch { /* stays null */ }
 
@@ -1422,24 +1518,14 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
   }
 
-  // ── Effective plan + monthly quota (resolved together; returns the plan) ──────
+  // ── Effective plan + monthly quota (Supabase; runs AFTER rate limiting) ───────
   const tQuota = Date.now()
   const quota = await checkMonthlyQuota(keyResult, ownerId, aiRequested)
   stage.quota = Date.now() - tQuota
-  if (!quota.ok && quota.kind === 'accounting') {
-    return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
-  }
-  const plan = quota.plan
-
-  // ── Rate limit (per effective plan; checked before a quota-exceeded rejection) ──
-  const tRate = Date.now()
-  const rateLimited = await checkRateLimit(apiKey, plan)
-  stage.rate_limit = Date.now() - tRate
-  if (rateLimited) {
-    const limit = getRateLimitPerMinute(plan)
-    return c.json({ error: `Rate limit exceeded. ${plan} plan allows ${limit} requests/minute.` }, 429)
-  }
   if (!quota.ok) {
+    if (quota.kind === 'accounting') {
+      return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
+    }
     const isAi = quota.quotaType === 'ai_extractions'
     return c.json(
       {
@@ -1609,29 +1695,30 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
         return c.json(rpcError(id, -32001, 'unauthorized'), 200)
       }
 
-      // extract=true (default) needs BOTH capture + AI quota; extract=false only capture.
-      const extract  = args.extract !== false // default true
-
-      // Effective plan + monthly quota (resolved together; returns the real plan for
-      // playground bypass — never the 'pro' placeholder). Fail closed on accounting.
-      const quota = await checkMonthlyQuota(keyResult, owner.ownerId, extract)
-      if (!quota.ok && quota.kind === 'accounting') {
-        return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Usage temporarily unavailable' }], isError: true }))
-      }
-      const plan = quota.plan
-
-      // Rate limit — same per-plan buckets as /screenshot (effective plan).
-      if (await checkRateLimit(apiKey, plan)) {
-        const limit = getRateLimitPerMinute(plan)
+      // Rate limit — BEFORE any Supabase query. Bucket on the resolved user id for
+      // bypass (else the API key); RPM from the key's own plan (real plan is looked
+      // up later in the monthly-quota check).
+      const rlPlan = normalizePlan(keyResult.plan)
+      const rlBucket = keyResult.viaBypass ? `user:${owner.ownerId}` : `key:${apiKey}`
+      if (await checkRateLimit(rlBucket, rlPlan)) {
         return c.json(rpcResult(id, {
-          content: [{ type: 'text', text: `Rate limit exceeded. ${plan} plan allows ${limit} requests/minute.` }],
+          content: [{ type: 'text', text: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.` }],
           isError: true,
         }))
       }
+
+      // extract=true (default) needs BOTH capture + AI quota; extract=false only capture.
+      const extract  = args.extract !== false // default true
+
+      // Effective plan + monthly quota (Supabase; AFTER rate limiting). Returns the
+      // real plan for playground bypass — never the 'pro' placeholder.
+      const quota = await checkMonthlyQuota(keyResult, owner.ownerId, extract)
       if (!quota.ok) {
-        const text = quota.quotaType === 'ai_extractions'
-          ? `Monthly AI extraction quota exceeded. ${quota.plan} plan allows ${quota.limit} AI extractions/month (used ${quota.used}).`
-          : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
+        const text = quota.kind === 'accounting'
+          ? 'Usage temporarily unavailable'
+          : quota.quotaType === 'ai_extractions'
+            ? `Monthly AI extraction quota exceeded. ${quota.plan} plan allows ${quota.limit} AI extractions/month (used ${quota.used}).`
+            : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
         return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
       }
 
