@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8"></head>
+<body style="height:3000px;margin:0;font-family:sans-serif">
+  <header id="nav" style="position:sticky;top:0;height:56px;background:#123;color:#fff;display:flex;align-items:center;padding:0 12px">Real Nav</header>
+  <h1 style="padding:20px">Page content</h1>
+  <consent-widget></consent-widget>
+  <newsletter-widget></newsletter-widget>
+  <script>
+    // Cookie/consent banner inside an OPEN shadow root (e.g. OneTrust-style web component).
+    class ConsentWidget extends HTMLElement {
+      connectedCallback() {
+        const sr = this.attachShadow({ mode: 'open' })
+        sr.innerHTML = '<div id="banner" style="position:fixed;bottom:0;left:0;width:100%;height:180px;z-index:9999;background:#fff;border-top:2px solid #333;padding:16px">This site uses cookies for consent and privacy. <button>Accept all</button></div>'
+      }
+    }
+    customElements.define('consent-widget', ConsentWidget)
+    // A large newsletter modal (also in shadow DOM) that is NOT a top nav.
+    class NewsletterWidget extends HTMLElement {
+      connectedCallback() {
+        const sr = this.attachShadow({ mode: 'open' })
+        sr.innerHTML = '<div id="modal" style="position:fixed;top:20%;left:20%;width:60%;height:50%;z-index:9000;background:#eee">Subscribe to our newsletter</div>'
+      }
+    }
+    customElements.define('newsletter-widget', NewsletterWidget)
+  </script>
+</body></html>

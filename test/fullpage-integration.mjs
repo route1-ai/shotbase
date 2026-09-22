@@ -73,12 +73,9 @@ async function shotImg(base, uid, extra) {
   }
 }
 async function waitUp(base) {
-  for (let i = 0; i < 40; i++) { try { const h = await fetch(`${base}/health`); if (h.ok && (await h.json()).supabase === true) return true } catch {} await sleep(500) }
+  // /health returns 200 only when subsystem checks pass (Supabase gates it here).
+  for (let i = 0; i < 60; i++) { try { const h = await fetch(`${base}/health`); if (h.ok) return true } catch {} await sleep(500) }
   return false
-}
-async function gateIdle(base) {
-  const h = await (await fetch(`${base}/health`)).json()
-  return h.browserActive === 0 && h.browserQueued === 0
 }
 
 const B = 'http://localhost:3971'
@@ -113,8 +110,10 @@ try {
   const after = rows.filter((r) => r.user_id === 'user_count').length
   assert(after - before === 1, `one full_page capture → exactly one usage row (delta=${after - before})`)
 
-  // gate must be idle after all the above (permits released on the normal prepass path)
-  assert(await gateIdle(B), 'BrowserGate drained to 0 after normal full-page captures')
+  // A subsequent capture still succeeds → permits were released, no slot leak.
+  // (Gate internals are covered directly by concurrency.mjs + fullpage-fixed.mjs.)
+  const followup = await shotImg(B, 'user_followup', { full_page: true, width: 823, height: 600 })
+  assert(followup.status === 200, `subsequent full-page capture still works → no permit leak (status=${followup.status})`)
 
   // NOTE: prepass-FAILURE handling (graceful degradation + BrowserGate permit
   // release + no slot leak + subsequent request works) is proven in

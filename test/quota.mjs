@@ -109,7 +109,9 @@ const AI = { ai_extract: { page_type: true } }              // real AI request
 const AI_ALLFALSE = { ai_extract: { page_type: false, prices: false } } // NOT an AI request
 
 async function waitUp(base, needSb) {
-  for (let i = 0; i < 30; i++) { try { const h = await fetch(`${base}/health`); if (h.ok) { const j = await h.json(); if (!needSb || j.supabase === true) return j } } catch {} await sleep(500) }
+  // /health now returns 200 { status:"ok" } only when its subsystem checks pass
+  // (Supabase connectivity gates it when configured), so h.ok is the readiness signal.
+  for (let i = 0; i < 60; i++) { try { const h = await fetch(`${base}/health`); if (h.ok) return await h.json() } catch {} await sleep(500) }
   return null
 }
 
@@ -229,7 +231,7 @@ try {
 
   // ── Supabase UNCONFIGURED → quota disabled (dev/self-host) ──────────────────
   console.log('── supabase unconfigured preserves quota-disabled dev behavior ──')
-  assert(h2.supabase === false, `no-supabase server reports supabase:false (got ${h2.supabase})`)
+  assert(h2?.status === 'ok', `no-supabase server is healthy (status=${h2?.status})`)
   // Even an AI request (which would need both quotas) is allowed → reaches SSRF 400.
   assert((await shot(BN, nextStatic(), null, { include_text: false })).status === 400, 'no-supabase: plain request → allowed (quota disabled)')
   const nosbMcp = await mcp(BN, nextStatic(), null, true)

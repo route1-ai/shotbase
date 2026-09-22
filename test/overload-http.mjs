@@ -55,7 +55,7 @@ const h = await fetch(`${BASE}/health`)
 const hms = Date.now() - t0
 const hb = await h.json()
 assert(h.status === 200 && hms < 1000, `/health responded in ${hms}ms (200) while captures in flight`)
-console.log(`  (health snapshot during load: active=${hb.browserActive} queued=${hb.browserQueued})`)
+console.log(`  (health during load: status=${hb.status})`)
 await queued
 
 // ── MCP overload: two concurrent captures; at least one image, and overflow is a clean isError ──
