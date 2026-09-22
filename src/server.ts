@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { chromium, Browser, BrowserContext } from 'playwright'
+import { PlaywrightBlocker } from '@ghostery/adblocker-playwright'
 import sharp from 'sharp'
 import Redis from 'ioredis'
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
@@ -13,6 +14,8 @@ const app = new Hono()
 // ─── Redis ────────────────────────────────────────────────────────────────────
 let redis: Redis | null = null
 const cacheMap = new Map<string, { buffer: Buffer; format: string; timestamp: number }>()
+// Data-mode (text / ai_extract JSON) results are cached separately from images.
+const dataCacheMap = new Map<string, { pageText: string | null; aiData?: Record<string, unknown>; aiError?: string; timestamp: number }>()
 const CACHE_TTL_MS = 60 * 1000
 
 if (process.env.REDIS_URL) {
@@ -64,6 +67,42 @@ async function getBrowser(): Promise<Browser> {
 // Warm up on startup (only when run as the entrypoint — not when imported by tests).
 if (require.main === module) {
   getBrowser().catch((err) => console.error('Browser warmup failed:', err))
+}
+
+// ─── Request-blocking engines (@ghostery/adblocker-playwright) ────────────────────
+// Two independent engines, each built ONCE at startup and enabled per-request only
+// when the caller asks (block_ads / remove_popups). If an engine fails to load
+// (e.g. no network at boot), it stays null and the capture proceeds WITHOUT blocking
+// — a blocker must never fail a request.
+//  • adBlocker    → prebuilt ads+tracking lists (the package offers fromPrebuiltAdsOnly
+//    / AdsAndTracking / Full; AdsAndTracking matches "ads and trackers").
+//  • popupBlocker → EasyList Cookie List + Fanboy's Annoyance List via fromLists
+//    (no cookie/annoyance-only prebuilt exists). These carry network + cosmetic rules
+//    that hide known cookie/consent banners; the DOM cleanup pass handles the rest.
+let adBlocker: PlaywrightBlocker | null = null
+let popupBlocker: PlaywrightBlocker | null = null
+const POPUP_FILTER_LISTS = [
+  'https://secure.fanboy.co.nz/fanboy-cookiemonster.txt', // EasyList Cookie List (Fanboy's Cookiemonster)
+  'https://secure.fanboy.co.nz/fanboy-annoyance.txt',     // Fanboy's Annoyance List
+]
+async function initBlockers(): Promise<void> {
+  try {
+    adBlocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch)
+    console.log('✓ Ad/tracker blocker ready')
+  } catch (err) {
+    console.error('Ad blocker engine failed to load (captures will not block ads):', err instanceof Error ? err.message : 'unknown')
+    adBlocker = null
+  }
+  try {
+    popupBlocker = await PlaywrightBlocker.fromLists(fetch, POPUP_FILTER_LISTS)
+    console.log('✓ Popup/cookie blocker ready')
+  } catch (err) {
+    console.error('Popup blocker engine failed to load (captures will not filter popups):', err instanceof Error ? err.message : 'unknown')
+    popupBlocker = null
+  }
+}
+if (require.main === module) {
+  initBlockers().catch((err) => console.error('Blocker init failed:', err))
 }
 
 // ─── Browser Concurrency Gate ───────────────────────────────────────────────────
@@ -430,6 +469,7 @@ async function validateSafeUrl(raw: string): Promise<{ ok: true } | { ok: false;
 }
 
 // ─── Core capture (shared by /screenshot and /api/mcp — wrap, don't rebuild) ───
+type WaitUntil = 'load' | 'domcontentloaded' | 'networkidle' | 'commit'
 interface CaptureOpts {
   url: string
   format: string
@@ -439,6 +479,14 @@ interface CaptureOpts {
   includeText: boolean
   aiExtract?: Record<string, boolean>
   ownerId: string
+  // Render controls (all optional with safe defaults; validated at the route)
+  waitUntil?: WaitUntil        // undefined = default strategy (load + short networkidle)
+  delayMs?: number             // extra settle after navigation, 0–10000
+  blockAds?: boolean           // enable the ads/tracker blocker engine
+  removePopups?: boolean       // enable the cookie/annoyance blocker + DOM cleanup
+  darkMode?: boolean           // colorScheme 'dark' on the context
+  deviceScaleFactor?: number   // 1–3, passed to newContext
+  captureImage?: boolean       // false → data mode (skip the screenshot entirely)
 }
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
@@ -454,9 +502,11 @@ type CaptureResult =
 // New strategy: wait for DOMContentLoaded (hard cap), then try networkidle only for a
 // short bound; if it doesn't settle, do a deterministic short settle and proceed
 // (never wait the full timeout before falling back).
-const NAV_TIMEOUT_MS         = Math.max(1000, Math.floor(Number(process.env.NAV_TIMEOUT_MS ?? 30_000)) || 30_000)
-const NAV_IDLE_MS            = Math.max(0, Math.floor(Number(process.env.NAV_IDLE_MS ?? 4_000)) || 4_000)
-const NAV_SETTLE_FALLBACK_MS = Math.max(0, Math.floor(Number(process.env.NAV_SETTLE_FALLBACK_MS ?? 750)) || 750)
+const NAV_TIMEOUT_MS          = Math.max(1000, Math.floor(Number(process.env.NAV_TIMEOUT_MS ?? 30_000)) || 30_000)
+// Short networkidle bound used with the DEFAULT strategy (goto 'load' then a brief
+// networkidle wait). The explicit wait_until='networkidle' uses a longer bound.
+const NAV_IDLE_DEFAULT_MS     = 2_000
+const NAV_IDLE_EXPLICIT_MS    = 10_000
 
 // ─── Bounded env parsing helpers (safe: NaN/out-of-range → clamped default) ───────
 function envInt(name: string, def: number, min: number, max: number): number {
@@ -664,11 +714,125 @@ function playwrightScrollPage(page: { evaluate: Function; waitForTimeout: Functi
   }
 }
 
+// ─── Popup / cookie-banner cleanup (remove_popups) ────────────────────────────────
+// Generic, click-free DOM pass that runs in the page. Removes cookie/consent/
+// newsletter overlays and full-screen backdrops, and un-locks html/body scrolling so
+// full-page captures work. Conservative: a small top header/nav (<15% viewport, at the
+// very top) is NEVER removed unless it carries consent wording. Runs inside a try in
+// the browser and returns a count; the caller also wraps it so a throw never fails a
+// capture. Kept as a standalone function so it can be unit-driven via Playwright.
+export const REMOVE_POPUPS_SCRIPT = (): number => {
+  let removed = 0
+  const vw = window.innerWidth, vh = window.innerHeight
+  if (!document.body || vw < 1 || vh < 1) return 0
+  // CONSENT/cookie wording (incl. common non-English terms) — a small top header/nav
+  // is removed ONLY if it carries THIS. Annoyance wording (newsletter/subscribe) alone
+  // must NOT strip a real nav bar that happens to have a "Subscribe" button.
+  const consentRx = /cookie|consent|consentement|datenschutz|privacidad|privacy|gdpr|dsgvo|zustimmen|einwilligung|politique de confidentialit|we use cookies|accept all/i
+  const annoyRx = /newsletter|subscribe|sign\s?up|akzeptieren|aceptar|accetta/i
+  const text = (el: Element) => (el.textContent || '').slice(0, 3000)
+  const num = (v: string) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0 }
+  const areaFrac = (r: DOMRect) => (Math.max(0, r.width) * Math.max(0, r.height)) / (vw * vh)
+
+  // Pass 1: fixed/sticky overlays and consent banners.
+  for (const el of Array.from(document.body.querySelectorAll<HTMLElement>('*'))) {
+    if (!el.isConnected) continue
+    const cs = getComputedStyle(el)
+    const pos = cs.position
+    if (pos !== 'fixed' && pos !== 'sticky') continue
+    if (cs.display === 'none' || cs.visibility === 'hidden' || num(cs.opacity) === 0) continue
+    const r = el.getBoundingClientRect()
+    if (r.width < 2 || r.height < 2) continue
+    const area = areaFrac(r)
+    const z = Math.round(num(cs.zIndex))
+    const t = text(el)
+    const isConsent = consentRx.test(t)
+    const isAnnoy = annoyRx.test(t)
+    const isTopAnchored = r.top <= 2
+    // Protect anything pinned to the very TOP that is not a consent bar and does not
+    // cover the page: real headers / nav / announcement bars — even tall ones with a
+    // "Subscribe" button. (A top-anchored consent bar or full-page overlay is NOT
+    // protected and is handled below.)
+    if (isTopAnchored && !isConsent && area <= 0.30) continue
+    const highZ = z >= 100
+    // Full-page overlay / modal (consent, newsletter, or generic) → remove.
+    if (highZ && area > 0.30) { el.remove(); removed++; continue }
+    // Consent/cookie banner at any size or position (top or bottom bar) → remove.
+    if (isConsent && area >= 0.03) { el.remove(); removed++; continue }
+    // Newsletter/subscribe pop-in that is NOT a top nav bar (centered/slide-in) → remove.
+    if (isAnnoy && highZ && area >= 0.15) { el.remove(); removed++; continue }
+  }
+
+  // Pass 2: full-screen backdrops/overlays (fixed, near-full-viewport, empty or semi-transparent).
+  for (const el of Array.from(document.body.querySelectorAll<HTMLElement>('*'))) {
+    if (!el.isConnected) continue
+    const cs = getComputedStyle(el)
+    if (cs.position !== 'fixed') continue
+    const r = el.getBoundingClientRect()
+    if (areaFrac(r) < 0.85) continue
+    const bg = cs.backgroundColor || ''
+    const semiTransparent = /rgba?\([^)]*,\s*(0?\.\d+)\s*\)/.test(bg) || (num(cs.opacity) > 0 && num(cs.opacity) < 1)
+    const empty = el.childElementCount === 0 || (el.textContent || '').trim().length === 0
+    if (semiTransparent || empty) { el.remove(); removed++ }
+  }
+
+  // Pass 3: un-lock scroll (scroll-locking overlays set these on html/body).
+  for (const el of [document.documentElement, document.body]) {
+    if (!el) continue
+    const cs = getComputedStyle(el)
+    if (cs.overflow === 'hidden' || cs.overflowY === 'hidden') el.style.setProperty('overflow', 'auto', 'important')
+    if (cs.position === 'fixed') el.style.setProperty('position', 'static', 'important')
+  }
+  return removed
+}
+
+// Bedrock structured extraction — extracted so it can start early and run in parallel
+// with the screenshot. Returns aiData on success, aiError on failure (graceful), and
+// the pure model-call duration. The raw provider error is logged server-side only.
+async function runBedrockExtraction(
+  aiExtract: Record<string, boolean>,
+  pageText: string,
+): Promise<{ aiData?: Record<string, unknown>; aiError?: string; ms: number }> {
+  const t0 = Date.now()
+  try {
+    const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
+    const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields.\n- page_type: one of [pricing, docs, blog, landing, product, other]\n- prices: array of price strings\n- headings: array of main headings\n- ctas: array of CTA button texts\nNo explanation. Just JSON.\n\nPage content:\n${pageText.slice(0, 8000)}\n\nRequested fields: ${JSON.stringify(fields)}`
+    const response = await bedrockClient!.send(
+      new ConverseCommand({
+        modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+        messages: [{ role: 'user', content: [{ text: prompt }] }],
+        inferenceConfig: { maxTokens: 1024, temperature: 0 },
+      }),
+    )
+    const result = response.output?.message?.content?.[0]?.text
+    if (result) {
+      try { return { aiData: JSON.parse(result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()), ms: Date.now() - t0 } }
+      catch { return { aiData: { raw: result }, ms: Date.now() - t0 } }
+    }
+    return { ms: Date.now() - t0 }
+  } catch (err) {
+    const aiError = err instanceof Error ? err.message : 'Unknown error'
+    console.error('Bedrock error:', aiError)
+    return { aiError, ms: Date.now() - t0 }
+  }
+}
+
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
+  const waitUntil = opts.waitUntil
+  const delayMs = Math.min(10_000, Math.max(0, Math.floor(opts.delayMs ?? 0)))
+  const blockAds = opts.blockAds === true
+  const removePopups = opts.removePopups === true
+  const darkMode = opts.darkMode === true
+  const deviceScaleFactor = Math.min(3, Math.max(1, opts.deviceScaleFactor ?? 1))
+  const captureImage = opts.captureImage !== false // default true; false = REST data mode
   // An ai_extract object where every value is false (or {}) is NOT an AI request:
   // don't extract text for it, don't invoke Bedrock, don't consume AI quota.
   const aiRequested = !!aiExtract && Object.values(aiExtract).some((v) => v === true)
+  const dataMode = includeText || aiRequested // JSON (text/ai) result, not an image
+  // Only REST data mode (no image) caches the JSON result. MCP sets captureImage=true
+  // even with ai_extract because it must return the image, so it is never data-cached.
+  const useDataCache = dataMode && !captureImage
   const startTime = Date.now()
   const timings: Record<string, number> = {}
   const mark = (k: string, from: number) => { timings[k] = Date.now() - from }
@@ -679,13 +843,34 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   mark('validationMs', tValidate)
   if (!safe.ok) return { ok: false, kind: 'ssrf', message: safe.reason }
 
-  // Cache (image-only modes, mirrors the original handler).
-  // Key MUST include every render-affecting parameter — width/height changed the
-  // pixels but were previously omitted, so a 320-wide and a 1440-wide capture of
-  // the same URL collided and served the wrong image.
-  const cacheKey = `cache:${CAPTURE_CACHE_VERSION}:${url}:${format}:${fullPage}:${width}x${height}`
+  // Cache keys — MUST include every render-affecting parameter so different options
+  // never collide. Image cache stores the binary; data cache stores the JSON result.
+  const renderKey = `${format}:${fullPage}:${width}x${height}:wu=${waitUntil ?? 'def'}:d=${delayMs}:ad${blockAds ? 1 : 0}:pp${removePopups ? 1 : 0}:dk${darkMode ? 1 : 0}:dsf${deviceScaleFactor}`
+  const cacheKey = `cache:${CAPTURE_CACHE_VERSION}:${url}:${renderKey}`
+  const aiFieldsKey = aiExtract ? Object.keys(aiExtract).filter((k) => aiExtract[k]).sort().join(',') : ''
+  const dataCacheKey = `datacache:${CAPTURE_CACHE_VERSION}:${url}:${renderKey}:it${includeText ? 1 : 0}:ai=${aiFieldsKey}`
   const now = Date.now()
-  if (!includeText && !aiExtract) {
+
+  if (useDataCache) {
+    // ── Data-mode cache (text / ai_data JSON), served + logged like an image hit ──
+    if (redis) {
+      try {
+        const hit = await redis.get(dataCacheKey)
+        if (hit) {
+          const d = JSON.parse(hit) as { pageText: string | null; aiData?: Record<string, unknown>; aiError?: string }
+          logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: 0, sizeKb: 0, cached: true })
+          return { ok: true, buffer: Buffer.alloc(0), contentType: getContentType(format), format, width, height, renderTime: 0, cached: true, pageText: d.pageText ?? null, aiData: d.aiData, aiError: d.aiError, timings }
+        }
+      } catch (err) { console.error('Redis data-cache get error:', err) }
+    } else {
+      const cd = dataCacheMap.get(dataCacheKey)
+      if (cd && now < cd.timestamp + CACHE_TTL_MS) {
+        logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: 0, sizeKb: 0, cached: true })
+        return { ok: true, buffer: Buffer.alloc(0), contentType: getContentType(format), format, width, height, renderTime: 0, cached: true, pageText: cd.pageText, aiData: cd.aiData, aiError: cd.aiError, timings }
+      }
+    }
+  } else if (!includeText && !aiExtract) {
+    // ── Image cache (plain capture only) ──
     if (redis) {
       try {
         const hit = await redis.get(cacheKey)
@@ -723,36 +908,62 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   let fallbackUsed = false
   try {
     const tCtx = Date.now()
-    context = await b.newContext()
+    context = await b.newContext({ colorScheme: darkMode ? 'dark' : 'light', deviceScaleFactor })
     const page = await context.newPage()
     await page.setViewportSize({ width, height })
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' })
     })
+    // Enable request-blocking engines for this page only when asked. Independent of
+    // each other; both can be on. A missing/failed engine → capture without blocking.
+    if (blockAds && adBlocker) {
+      try { await adBlocker.enableBlockingInPage(page) } catch (err) { console.error('block_ads enable failed (continuing):', err instanceof Error ? err.message : 'unknown') }
+    }
+    if (removePopups && popupBlocker) {
+      try { await popupBlocker.enableBlockingInPage(page) } catch (err) { console.error('remove_popups blocker enable failed (continuing):', err instanceof Error ? err.message : 'unknown') }
+    }
     mark('contextCreateMs', tCtx)
 
-    // ── Bounded navigation ────────────────────────────────────────────────────
-    // 1) DOMContentLoaded (hard cap). A throw here IS a real navigation/capture failure.
+    // ── Navigation + wait strategy ─────────────────────────────────────────────
+    // 30s goto cap always. waitForLoadState timeouts are SWALLOWED — a page that
+    // never goes network-quiet must still be captured with whatever has rendered.
     const tNav = Date.now()
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
+    const gotoWait: WaitUntil = (waitUntil === 'load' || waitUntil === 'domcontentloaded' || waitUntil === 'commit') ? waitUntil : 'load'
+    await page.goto(url, { waitUntil: gotoWait, timeout: NAV_TIMEOUT_MS })
     mark('navigationMs', tNav)
-    // 2) Try to reach networkidle, but only for a short bound. If it doesn't settle,
-    //    fall back to a deterministic settle delay instead of waiting the full timeout.
     const tSettle = Date.now()
-    try {
-      await page.waitForLoadState('networkidle', { timeout: NAV_IDLE_MS })
-    } catch {
-      fallbackUsed = true
-      await page.waitForTimeout(NAV_SETTLE_FALLBACK_MS)
+    if (waitUntil === undefined) {
+      // Default: goto 'load', then a short networkidle wait (best-effort).
+      try { await page.waitForLoadState('networkidle', { timeout: NAV_IDLE_DEFAULT_MS }) } catch { fallbackUsed = true }
+    } else if (waitUntil === 'networkidle') {
+      // Explicit networkidle: goto 'load', then a longer networkidle wait (best-effort).
+      try { await page.waitForLoadState('networkidle', { timeout: NAV_IDLE_EXPLICIT_MS }) } catch { fallbackUsed = true }
     }
+    // load / domcontentloaded / commit: nothing extra after goto.
+    if (delayMs > 0) await page.waitForTimeout(delayMs)
     mark('settleMs', tSettle)
-    // 3) Meaningful-content guard: only discard if the page produced essentially nothing.
+
+    // ── Meaningful-content guard: only discard if the page produced ~nothing. ──
     const hasContent = await page.evaluate(
       () => ((document.body?.innerText || '').trim().length > 0) || ((document.body?.childElementCount ?? 0) > 3)
     ).catch(() => true)
     if (!hasContent) {
       logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
       return { ok: false, kind: 'capture', message: 'Navigation completed but page produced no content' }
+    }
+
+    // ── Popup / cookie-banner DOM cleanup (remove_popups) ──────────────────────
+    // Runs after wait+delay and before the prepass so full-page scrolling works on
+    // the un-locked page. A throw is logged and ignored — capture proceeds anyway.
+    if (removePopups) {
+      const tPopups = Date.now()
+      try {
+        const removed = await page.evaluate(REMOVE_POPUPS_SCRIPT)
+        if (removed > 0) console.log(`[remove_popups] removed ${removed} element(s)`)
+      } catch (err) {
+        console.error('remove_popups cleanup error (continuing):', err instanceof Error ? err.message : 'unknown')
+      }
+      mark('popupsMs', tPopups)
     }
 
     // ── Fixed/sticky top-element overlay: DETECT + SNAPSHOT (page still at top) ──
@@ -763,7 +974,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     let fixedOverlayDetected = false
     let fixedOverlayHeight = 0
     let fixedOverlayMs = 0
-    const wantFixedOverlay = fullPage && format !== 'pdf' && FULLPAGE_SCROLL_ENABLED && FULLPAGE_FIXED_OVERLAY_ENABLED
+    const wantFixedOverlay = captureImage && fullPage && format !== 'pdf' && FULLPAGE_SCROLL_ENABLED && FULLPAGE_FIXED_OVERLAY_ENABLED
     if (wantFixedOverlay) {
       const tFix = Date.now()
       try {
@@ -813,7 +1024,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     // Text extraction runs AFTER the prepass so lazy-inserted text is included.
     const tText = Date.now()
     let pageText: string | null = null
-    if (includeText || aiRequested) {
+    if (dataMode) {
       try {
         pageText = await page.evaluate(() => document.body.innerText)
         pageText = pageText?.replace(/\n\s*\n/g, '\n\n').trim() ?? null
@@ -823,44 +1034,54 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     }
     mark('pageTextMs', tText)
 
+    // Start Bedrock the moment text is available so it overlaps the screenshot; await
+    // it after. In data mode there is no screenshot to overlap (Bedrock runs alone).
+    const doBedrock = aiRequested && !!aiExtract && !!bedrockClient && !!pageText
+    const bedrockPromise = doBedrock
+      ? runBedrockExtraction(aiExtract as Record<string, boolean>, pageText as string)
+      : Promise.resolve<{ aiData?: Record<string, unknown>; aiError?: string; ms: number }>({ ms: 0 })
+
+    // ── Screenshot — SKIPPED in REST data mode (screenshot_url is null there). ──
     const tShot = Date.now()
-    let buffer: Buffer
-    let contentType: string
+    let buffer: Buffer = Buffer.alloc(0)
+    let contentType = getContentType(format)
     let fixedOverlayComposited = false
-    if (format === 'pdf') {
-      buffer = Buffer.from(await page.pdf({ format: 'A4', printBackground: true }))
-      contentType = 'application/pdf'
-    } else if (fixedOverlay) {
-      // Full-page image with a captured top overlay: hide the detected fixed/sticky
-      // elements for the shot (no stray/duplicate copy at the bottom), take the
-      // full-page PNG, restore, then composite the overlay strip back at y=0. Both
-      // images are the same width at DPR 1, so the composite aligns pixel-for-pixel.
-      const overlay = fixedOverlay
-      const tFixComposite = Date.now()
-      buffer = await screenshotWithFixedOverlay({
-        hide: () => page.evaluate(HIDE_FIXED),
-        screenshotPng: async () => Buffer.from(await page.screenshot({ type: 'png', fullPage: true })),
-        restore: () => page.evaluate(RESTORE_FIXED),
-        composite: async (base) => {
-          const img = sharp(base).composite([{ input: overlay, top: 0, left: 0 }])
-          if (format === 'jpeg') return img.jpeg({ quality: 80 }).toBuffer()
-          if (format === 'webp') return img.webp().toBuffer()
-          return img.png().toBuffer()
-        },
-      })
-      contentType = getContentType(format)
-      fixedOverlayComposited = true
-      fixedOverlayMs += Date.now() - tFixComposite
-    } else if (format === 'jpeg') {
-      buffer = Buffer.from(await page.screenshot({ type: 'jpeg', quality: 80, fullPage }))
-      contentType = 'image/jpeg'
-    } else if (format === 'webp') {
-      const png = await page.screenshot({ type: 'png', fullPage })
-      buffer = await sharp(png).webp().toBuffer()
-      contentType = 'image/webp'
-    } else {
-      buffer = Buffer.from(await page.screenshot({ type: 'png', fullPage }))
-      contentType = 'image/png'
+    if (captureImage) {
+      if (format === 'pdf') {
+        buffer = Buffer.from(await page.pdf({ format: 'A4', printBackground: true }))
+        contentType = 'application/pdf'
+      } else if (fixedOverlay) {
+        // Full-page image with a captured top overlay: hide the detected fixed/sticky
+        // elements for the shot (no stray/duplicate copy at the bottom), take the
+        // full-page PNG, restore, then composite the overlay strip back at y=0. Both
+        // images are the same width at the same DPR, so the composite aligns exactly.
+        const overlay = fixedOverlay
+        const tFixComposite = Date.now()
+        buffer = await screenshotWithFixedOverlay({
+          hide: () => page.evaluate(HIDE_FIXED),
+          screenshotPng: async () => Buffer.from(await page.screenshot({ type: 'png', fullPage: true })),
+          restore: () => page.evaluate(RESTORE_FIXED),
+          composite: async (base) => {
+            const img = sharp(base).composite([{ input: overlay, top: 0, left: 0 }])
+            if (format === 'jpeg') return img.jpeg({ quality: 80 }).toBuffer()
+            if (format === 'webp') return img.webp().toBuffer()
+            return img.png().toBuffer()
+          },
+        })
+        contentType = getContentType(format)
+        fixedOverlayComposited = true
+        fixedOverlayMs += Date.now() - tFixComposite
+      } else if (format === 'jpeg') {
+        buffer = Buffer.from(await page.screenshot({ type: 'jpeg', quality: 80, fullPage }))
+        contentType = 'image/jpeg'
+      } else if (format === 'webp') {
+        const png = await page.screenshot({ type: 'png', fullPage })
+        buffer = await sharp(png).webp().toBuffer()
+        contentType = 'image/webp'
+      } else {
+        buffer = Buffer.from(await page.screenshot({ type: 'png', fullPage }))
+        contentType = 'image/png'
+      }
     }
     mark('screenshotMs', tShot)
     // Fixed-overlay observability (internal; additive timings + narrow header/JSON).
@@ -872,43 +1093,28 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       console.log(`[fixedoverlay] detected=${fixedOverlayDetected} height=${fixedOverlayHeight} composited=${fixedOverlayComposited} ms=${fixedOverlayMs}`)
     }
 
-    // AI extraction — a Bedrock failure is reported via aiError; the image stays valid.
-    const tBedrock = Date.now()
-    let aiData: Record<string, unknown> | undefined
-    let aiError: string | undefined
-    if (aiRequested && aiExtract && bedrockClient && pageText) {
-      try {
-        const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
-        const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields.\n- page_type: one of [pricing, docs, blog, landing, product, other]\n- prices: array of price strings\n- headings: array of main headings\n- ctas: array of CTA button texts\nNo explanation. Just JSON.\n\nPage content:\n${pageText.slice(0, 8000)}\n\nRequested fields: ${JSON.stringify(fields)}`
-        const response = await bedrockClient.send(
-          new ConverseCommand({
-            modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-            messages: [{ role: 'user', content: [{ text: prompt }] }],
-            inferenceConfig: { maxTokens: 1024, temperature: 0 },
-          })
-        )
-        const result = response.output?.message?.content?.[0]?.text
-        if (result) {
-          try { aiData = JSON.parse(result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()) }
-          catch { aiData = { raw: result } }
-        }
-      } catch (err) {
-        aiError = err instanceof Error ? err.message : 'Unknown error'
-        console.error('Bedrock error:', aiError)
-      }
-    }
-
-    mark('bedrockMs', tBedrock)
+    // Await the (parallel) Bedrock result. A failure is reported via aiError only.
+    const bedrock = await bedrockPromise
+    const aiData = bedrock.aiData
+    const aiError = bedrock.aiError
+    timings.bedrockMs = bedrock.ms
     // ai_succeeded is true ONLY when Bedrock produced an AI result. A Bedrock
     // failure (graceful degradation → aiData undefined + aiError) stays false.
     const aiSucceeded = aiRequested && aiData !== undefined
     const renderTime = Date.now() - startTime
     timings.totalMs = renderTime
-    if (redis) {
-      try { await redis.setex(cacheKey, 60, buffer.toString('base64')) } catch {}
-    } else {
-      cacheMap.set(cacheKey, { buffer, format, timestamp: now })
+
+    // ── Cache write (fire-and-forget for Redis so it never blocks the response) ──
+    const tCacheWrite = Date.now()
+    if (useDataCache) {
+      const payload = { pageText, aiData, aiError }
+      if (redis) redis.setex(dataCacheKey, 60, JSON.stringify(payload)).catch((err) => console.error('Redis data-cache write error:', err instanceof Error ? err.message : 'unknown'))
+      else dataCacheMap.set(dataCacheKey, { ...payload, timestamp: now })
+    } else if (!includeText && !aiExtract) {
+      if (redis) redis.setex(cacheKey, 60, buffer.toString('base64')).catch((err) => console.error('Redis cache write error:', err instanceof Error ? err.message : 'unknown'))
+      else cacheMap.set(cacheKey, { buffer, format, timestamp: now })
     }
+    mark('cacheWriteMs', tCacheWrite)
     logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false, aiRequested, aiSucceeded })
 
     return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed, scrollDiag,
@@ -928,6 +1134,41 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
 // (which can carry AWS account state, IAM/ARN details, or other internals) is
 // logged server-side only — never returned to the caller.
 const AI_EXTRACT_UNAVAILABLE_MSG = 'AI extraction temporarily unavailable'
+
+// ─── Server-Timing instrumentation ───────────────────────────────────────────
+// Emit a standard `Server-Timing` header (and a matching log line) so per-stage
+// latency is visible in the browser/network tab and logs. Handler stages
+// (verify_key, rate_limit, quota) are measured in the route; capture stages come
+// from performCapture's internal `timings` (mapped to stable public stage names).
+const CAPTURE_STAGE_NAMES: Record<string, string> = {
+  validationMs:    'dns_check',
+  contextCreateMs: 'new_context',
+  navigationMs:    'goto',
+  settleMs:        'settle',
+  popupsMs:        'popups',
+  pageTextMs:      'page_text',
+  screenshotMs:    'screenshot',
+  bedrockMs:       'bedrock',
+  cacheWriteMs:    'cache_write',
+}
+const SERVER_TIMING_ORDER = [
+  'verify_key', 'rate_limit', 'quota', 'dns_check', 'new_context', 'goto',
+  'settle', 'popups', 'page_text', 'screenshot', 'bedrock', 'cache_write',
+]
+function captureStageTimings(timings?: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (!timings) return out
+  for (const [internal, name] of Object.entries(CAPTURE_STAGE_NAMES)) {
+    if (typeof timings[internal] === 'number') out[name] = timings[internal]
+  }
+  return out
+}
+function buildServerTiming(stages: Record<string, number>): string {
+  return SERVER_TIMING_ORDER
+    .filter((k) => typeof stages[k] === 'number')
+    .map((k) => `${k};dur=${Math.round(stages[k])}`)
+    .join(', ')
+}
 
 // ─── Body-size protection (Phase B) ─────────────────────────────────────────────
 // Reject oversized/malformed-oversized requests before any browser or AI work, so a
@@ -1009,38 +1250,31 @@ async function getUserPlan(userId: string): Promise<string | null> {
   }
 }
 
-// Resolve the effective, normalized plan to enforce for BOTH rate limiting and
-// monthly quotas. The trusted playground (bypass) key authenticates as a generic
-// 'pro' placeholder, so its REAL plan must be read from Supabase users.plan BEFORE
-// any user-facing limit is applied — otherwise a Free user coming through the
-// playground would inherit the placeholder's higher rate. Any other caller uses
-// its own key plan (the X-Shotbase-User-Id header is never trusted for plan).
-// Fails closed when accounting is configured but the plan lookup fails.
-type PlanResolution = { ok: true; plan: CanonicalPlan } | { ok: false; kind: 'accounting' }
-async function resolveEffectivePlan(keyResult: UnkeyResult, ownerId: string): Promise<PlanResolution> {
-  if (keyResult.viaBypass && supabase) {
-    const real = await getUserPlan(ownerId)
-    if (real === null) return { ok: false, kind: 'accounting' }
-    return { ok: true, plan: normalizePlan(real) }
-  }
-  return { ok: true, plan: normalizePlan(keyResult.plan) }
-}
-
 type QuotaResult =
-  | { ok: true }
+  | { ok: true; plan: CanonicalPlan }
   | { ok: false; kind: 'quota'; quotaType: 'captures' | 'ai_extractions'; plan: CanonicalPlan; limit: number; used: number }
   | { ok: false; kind: 'accounting' }
-// Enforce the monthly caps for an already-resolved effective plan. Capture quota is
-// always checked; the AI-extraction quota only when the request actually asks for AI
-// (aiRequested). Capture-exhausted takes precedence over AI-exhausted. Any required
-// count query failing → accounting failure (fail closed). No-op when Supabase unset.
-// NOTE: non-atomic (count → serve → fire-and-forget log), so concurrent requests at
-// the boundary can overshoot by up to the number of in-flight captures.
-async function checkMonthlyQuota(plan: CanonicalPlan, ownerId: string, aiRequested: boolean): Promise<QuotaResult> {
-  if (!supabase) return { ok: true } // quota disabled (no accounting backend)
+// Resolve the effective, normalized plan AND enforce the monthly caps in one place,
+// returning the plan for rate limiting. For a playground (bypass) caller the REAL
+// plan lives in Supabase users.plan (the bypass authenticates as a generic 'pro'
+// placeholder — a Free user must NOT inherit it); that lookup runs IN PARALLEL with
+// the capture-usage count, so a bypass request is one round-trip instead of two.
+// The X-Shotbase-User-Id header is never trusted for plan. Capture quota is always
+// checked; AI quota only when the request asks for AI, and it takes second
+// precedence. Any required query failing → accounting failure (fail closed).
+// Supabase unset → quota disabled, plan from the (normalized) key. NOTE: non-atomic
+// (count → serve → fire-and-forget log), so concurrent requests at the boundary can
+// overshoot by up to the number of in-flight captures.
+async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string, aiRequested: boolean): Promise<QuotaResult> {
+  if (!supabase) return { ok: true, plan: normalizePlan(keyResult.plan) } // quota disabled
 
-  const captureUsage = await getMonthlyUsage(ownerId)
-  if (captureUsage === null) return { ok: false, kind: 'accounting' } // configured but query failed → fail closed
+  const [planRaw, captureUsage] = await Promise.all([
+    keyResult.viaBypass ? getUserPlan(ownerId) : Promise.resolve<string | null>(keyResult.plan),
+    getMonthlyUsage(ownerId),
+  ])
+  if (keyResult.viaBypass && planRaw === null) return { ok: false, kind: 'accounting' } // real plan unresolved → fail closed
+  const plan = normalizePlan(planRaw ?? keyResult.plan)
+  if (captureUsage === null) return { ok: false, kind: 'accounting' } // count failed → fail closed
   const captureLimit = getCaptureQuota(plan)
   if (captureUsage >= captureLimit) {
     return { ok: false, kind: 'quota', quotaType: 'captures', plan, limit: captureLimit, used: captureUsage }
@@ -1054,7 +1288,7 @@ async function checkMonthlyQuota(plan: CanonicalPlan, ownerId: string, aiRequest
       return { ok: false, kind: 'quota', quotaType: 'ai_extractions', plan, limit: aiLimit, used: aiUsage }
     }
   }
-  return { ok: true }
+  return { ok: true, plan }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -1080,7 +1314,10 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   const apiKey = match?.[1]?.trim()
   if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>' }, 401)
 
+  const stage: Record<string, number> = {}
+  const tVerify = Date.now()
   const keyResult = await verifyKey(apiKey)
+  stage.verify_key = Date.now() - tVerify
   if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
 
   // Attribute to the real user. Bypass callers MUST assert a valid user id or we
@@ -1089,26 +1326,10 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   if (!owner.ok) return c.json({ error: owner.message }, 401)
   const ownerId = owner.ownerId
 
-  // ── Effective plan ──────────────────────────────────────────────────────────
-  // Resolve the REAL, normalized plan before any user-facing limit. For a
-  // playground bypass caller this reads Supabase users.plan (so a Free user via the
-  // playground is rate-limited/quota'd as Free, not as the bypass's 'pro' placeholder).
-  // Configured-but-unresolvable → fail closed. Supabase unset → normalized key plan.
-  const effective = await resolveEffectivePlan(keyResult, ownerId)
-  if (!effective.ok) return c.json({ error: 'Usage temporarily unavailable' }, 503)
-  const plan = effective.plan
-
-  // ── Rate limit ────────────────────────────────────────────────────────────
-  const rateLimited = await checkRateLimit(apiKey, plan)
-  if (rateLimited) {
-    const limit = getRateLimitPerMinute(plan)
-    return c.json(
-      { error: `Rate limit exceeded. ${plan} plan allows ${limit} requests/minute.` },
-      429
-    )
-  }
-
-  // ── Parse body ────────────────────────────────────────────────────────────
+  // ── Parse body ──────────────────────────────────────────────────────────────
+  // Parsed before quota/rate so aiRequested is known (AI needs both quotas). The
+  // effective plan + monthly quota now resolve together (checkMonthlyQuota), which
+  // returns the plan the rate limiter uses.
   let body: Record<string, unknown> | null = null
   try { body = await c.req.json() } catch { /* stays null */ }
 
@@ -1150,6 +1371,29 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     return c.json({ error: '"height" must be an integer between 100 and 2160' }, 400)
   }
 
+  // ── Wait strategy + render options (all optional, validated like the rest) ──
+  let waitUntil: WaitUntil | undefined
+  if (body?.wait_until !== undefined) {
+    if (!['load', 'domcontentloaded', 'networkidle', 'commit'].includes(body.wait_until as string)) {
+      return c.json({ error: '"wait_until" must be one of: load, domcontentloaded, networkidle, commit' }, 400)
+    }
+    waitUntil = body.wait_until as WaitUntil
+  }
+  const delayMs = (body?.delay_ms ?? 0) as number
+  if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 10000) {
+    return c.json({ error: '"delay_ms" must be an integer between 0 and 10000' }, 400)
+  }
+  const blockAds = body?.block_ads ?? false
+  if (typeof blockAds !== 'boolean') return c.json({ error: '"block_ads" must be a boolean' }, 400)
+  const removePopups = body?.remove_popups ?? false
+  if (typeof removePopups !== 'boolean') return c.json({ error: '"remove_popups" must be a boolean' }, 400)
+  const darkMode = body?.dark_mode ?? false
+  if (typeof darkMode !== 'boolean') return c.json({ error: '"dark_mode" must be a boolean' }, 400)
+  const deviceScaleFactor = (body?.device_scale_factor ?? 1) as number
+  if (typeof deviceScaleFactor !== 'number' || !Number.isFinite(deviceScaleFactor) || deviceScaleFactor < 1 || deviceScaleFactor > 3) {
+    return c.json({ error: '"device_scale_factor" must be a number between 1 and 3' }, 400)
+  }
+
   // ai_extract — a plain object of boolean flags, field-count capped (B6). Reject
   // arrays, null, non-objects, or non-boolean values rather than coercing silently.
   let aiExtract: Record<string, boolean> | undefined
@@ -1178,26 +1422,43 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
   }
 
-  // ── Monthly quota (dual: captures + AI extractions) ──────────────────────────
-  const quota = await checkMonthlyQuota(plan, ownerId, aiRequested)
-  if (!quota.ok) {
-    if (quota.kind === 'quota') {
-      const isAi = quota.quotaType === 'ai_extractions'
-      return c.json(
-        {
-          error: isAi ? 'Monthly AI extraction quota exceeded' : 'Monthly capture quota exceeded',
-          quota_type: quota.quotaType,
-          limit: quota.limit,
-          used: quota.used,
-        },
-        429,
-      )
-    }
+  // ── Effective plan + monthly quota (resolved together; returns the plan) ──────
+  const tQuota = Date.now()
+  const quota = await checkMonthlyQuota(keyResult, ownerId, aiRequested)
+  stage.quota = Date.now() - tQuota
+  if (!quota.ok && quota.kind === 'accounting') {
     return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
+  }
+  const plan = quota.plan
+
+  // ── Rate limit (per effective plan; checked before a quota-exceeded rejection) ──
+  const tRate = Date.now()
+  const rateLimited = await checkRateLimit(apiKey, plan)
+  stage.rate_limit = Date.now() - tRate
+  if (rateLimited) {
+    const limit = getRateLimitPerMinute(plan)
+    return c.json({ error: `Rate limit exceeded. ${plan} plan allows ${limit} requests/minute.` }, 429)
+  }
+  if (!quota.ok) {
+    const isAi = quota.quotaType === 'ai_extractions'
+    return c.json(
+      {
+        error: isAi ? 'Monthly AI extraction quota exceeded' : 'Monthly capture quota exceeded',
+        quota_type: quota.quotaType,
+        limit: quota.limit,
+        used: quota.used,
+      },
+      429,
+    )
   }
 
   // ── Capture (shared core) ──────────────────────────────────────────────────
-  const r = await performCapture({ url, format, fullPage, width, height, includeText, aiExtract, ownerId })
+  // REST data mode (include_text/ai_extract) returns JSON → skip the screenshot.
+  const captureImage = !(includeText || aiRequested)
+  const r = await performCapture({
+    url, format, fullPage, width, height, includeText, aiExtract, ownerId,
+    waitUntil, delayMs, blockAds, removePopups, darkMode, deviceScaleFactor, captureImage,
+  })
   if (!r.ok) {
     if (r.kind === 'ssrf') return c.json({ error: 'Blocked URL', detail: r.message }, 400)
     if (r.kind === 'overloaded') {
@@ -1209,6 +1470,11 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     }
     return c.json({ error: 'Screenshot failed', detail: r.message }, 500)
   }
+
+  // ── Server-Timing (success responses only) ──────────────────────────────────
+  const serverTiming = buildServerTiming({ ...stage, ...captureStageTimings(r.timings) })
+  console.log(`[timing] ${url} cache=${r.cached ? 'HIT' : 'MISS'} ${serverTiming}`)
+
   // Preserve existing behavior: a Bedrock failure during ai_extract is a 500.
   // JSON response for text/AI modes. A Bedrock failure no longer discards the
   // successful render (Option B): return 200 with ai_data:null + a generic
@@ -1227,17 +1493,18 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
       ai_error: (aiRequested && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
       fallback_used: r.fallbackUsed ?? false,
       timings: r.timings,
-    })
+    }, 200, { 'Server-Timing': serverTiming })
   }
 
   if (r.cached) {
-    return c.body(new Uint8Array(r.buffer), 200, { 'Content-Type': r.contentType, 'X-Cache': 'HIT' })
+    return c.body(new Uint8Array(r.buffer), 200, { 'Content-Type': r.contentType, 'X-Cache': 'HIT', 'Server-Timing': serverTiming })
   }
   const imgHeaders: Record<string, string> = {
     'Content-Type': r.contentType,
     'X-Cache': 'MISS',
     'X-Render-Time': String(r.renderTime),
     'X-Nav-Fallback': String(r.fallbackUsed ?? false),
+    'Server-Timing': serverTiming,
   }
   // Additive full-page scroll diagnostics (only present when the prepass ran).
   if (r.scrollDiag) {
@@ -1342,13 +1609,16 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
         return c.json(rpcError(id, -32001, 'unauthorized'), 200)
       }
 
-      // Effective plan — real plan for playground bypass (fail closed if unresolved),
-      // so RPM + quotas use the true plan, never the bypass's 'pro' placeholder.
-      const effective = await resolveEffectivePlan(keyResult, owner.ownerId)
-      if (!effective.ok) {
+      // extract=true (default) needs BOTH capture + AI quota; extract=false only capture.
+      const extract  = args.extract !== false // default true
+
+      // Effective plan + monthly quota (resolved together; returns the real plan for
+      // playground bypass — never the 'pro' placeholder). Fail closed on accounting.
+      const quota = await checkMonthlyQuota(keyResult, owner.ownerId, extract)
+      if (!quota.ok && quota.kind === 'accounting') {
         return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Usage temporarily unavailable' }], isError: true }))
       }
-      const plan = effective.plan
+      const plan = quota.plan
 
       // Rate limit — same per-plan buckets as /screenshot (effective plan).
       if (await checkRateLimit(apiKey, plan)) {
@@ -1358,21 +1628,10 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
           isError: true,
         }))
       }
-
-      // extract=true (default) needs BOTH capture + AI quota; extract=false only capture.
-      const extract  = args.extract !== false // default true
-
-      // Monthly quota — dual (captures always; AI extractions only when extract=true).
-      const quota = await checkMonthlyQuota(plan, owner.ownerId, extract)
       if (!quota.ok) {
-        let text: string
-        if (quota.kind === 'quota') {
-          text = quota.quotaType === 'ai_extractions'
-            ? `Monthly AI extraction quota exceeded. ${quota.plan} plan allows ${quota.limit} AI extractions/month (used ${quota.used}).`
-            : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
-        } else {
-          text = 'Usage temporarily unavailable'
-        }
+        const text = quota.quotaType === 'ai_extractions'
+          ? `Monthly AI extraction quota exceeded. ${quota.plan} plan allows ${quota.limit} AI extractions/month (used ${quota.used}).`
+          : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
         return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
       }
 
@@ -1386,6 +1645,7 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
         includeText: false,
         aiExtract: extract ? { page_type: true, headings: true, ctas: true, prices: true } : undefined,
         ownerId: owner.ownerId,
+        captureImage: true, // MCP always returns the image
       })
 
       if (!r.ok) {
