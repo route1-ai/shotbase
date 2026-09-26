@@ -1368,6 +1368,37 @@ function quotaHeaders(u: QuotaUsage): Record<string, string> {
   return h
 }
 
+// Next monthly reset as a unix epoch (start of next UTC month). Mirrors
+// startOfMonthUtcIso's boundary; used by GET /quota so callers know when caps roll.
+function monthlyResetEpoch(): number {
+  const n = new Date()
+  return Math.floor(Date.UTC(n.getUTCFullYear(), n.getUTCMonth() + 1, 1) / 1000)
+}
+
+// Read-only quota snapshot for GET /quota: resolves the real plan and reads BOTH
+// monthly counts (captures + AI) WITHOUT enforcing anything or spending a capture.
+// Unlike checkMonthlyQuota it never 429s and always reads the AI count. Fail closed:
+// a plan or count query failure → accounting error (503), never a fabricated number.
+// Supabase unset (dev/self-host) → quota disabled, usage 0 against the key's plan.
+type QuotaSnapshot =
+  | { ok: true; plan: CanonicalPlan; captureUsage: number; captureLimit: number; aiUsage: number; aiLimit: number }
+  | { ok: false; kind: 'accounting' }
+async function getQuotaSnapshot(keyResult: UnkeyResult, ownerId: string): Promise<QuotaSnapshot> {
+  if (!supabase) {
+    const plan = normalizePlan(keyResult.plan) // quota disabled → report a full budget
+    return { ok: true, plan, captureUsage: 0, captureLimit: getCaptureQuota(plan), aiUsage: 0, aiLimit: getAiExtractionQuota(plan) }
+  }
+  const [planRaw, captureUsage, aiUsage] = await Promise.all([
+    keyResult.viaBypass ? getUserPlan(ownerId) : Promise.resolve<string | null>(keyResult.plan),
+    getMonthlyUsage(ownerId),
+    getMonthlyAiUsage(ownerId),
+  ])
+  if (keyResult.viaBypass && planRaw === null) return { ok: false, kind: 'accounting' } // real plan unresolved → fail closed
+  if (captureUsage === null || aiUsage === null) return { ok: false, kind: 'accounting' } // count failed → fail closed
+  const plan = normalizePlan(planRaw ?? keyResult.plan)
+  return { ok: true, plan, captureUsage, captureLimit: getCaptureQuota(plan), aiUsage, aiLimit: getAiExtractionQuota(plan) }
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 // ─── Health check (honest, cached) ────────────────────────────────────────────
 // Public response is only { status, service }; per-subsystem detail is logged, not
@@ -1420,6 +1451,54 @@ app.get('/health', async (c) => {
   }
   const ok = healthCache.ok
   return c.json({ status: ok ? 'ok' : 'degraded', service: 'shotbase' }, ok ? 200 : 503)
+})
+
+// ─── Quota (read remaining budget without spending a capture) ────────────────────
+// Authenticated, rate-limited, read-only. Returns captures + AI extractions used/
+// limit/remaining and the next reset epoch — so a caller can check its budget
+// without making an ai_extract call just to read a header. Mirrors /screenshot's
+// auth + rate-limit path exactly; NEVER counts a capture.
+app.get('/quota', async (c) => {
+  const authorization = c.req.header('Authorization')
+  if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
+  const match = authorization.match(/^Bearer\s+(.+)$/)
+  const apiKey = match?.[1]?.trim()
+  if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>' }, 401)
+
+  const keyResult = await verifyKey(apiKey)
+  if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
+
+  const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
+  if (!owner.ok) return c.json({ error: owner.message }, 401)
+  const ownerId = owner.ownerId
+
+  // Rate limit BEFORE any Supabase query (same bucket/plan rules as /screenshot).
+  const rlPlan = normalizePlan(keyResult.plan)
+  const rlBucket = keyResult.viaBypass ? `user:${ownerId}` : `key:${apiKey}`
+  if (await checkRateLimit(rlBucket, rlPlan)) {
+    return c.json({ error: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.` }, 429)
+  }
+
+  const snap = await getQuotaSnapshot(keyResult, ownerId)
+  if (!snap.ok) return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
+
+  const reset = monthlyResetEpoch()
+  const capRemaining = Math.max(0, snap.captureLimit - snap.captureUsage)
+  const aiRemaining = Math.max(0, snap.aiLimit - snap.aiUsage)
+  return c.json(
+    {
+      plan: snap.plan,
+      captures: { used: snap.captureUsage, limit: snap.captureLimit, remaining: capRemaining },
+      ai_extractions: { used: snap.aiUsage, limit: snap.aiLimit, remaining: aiRemaining },
+      reset,
+    },
+    200,
+    {
+      'X-Shotbase-Captures-Remaining': String(capRemaining),
+      'X-Shotbase-AI-Remaining': String(aiRemaining),
+      'X-Shotbase-Quota-Reset': String(reset),
+    },
+  )
 })
 
 app.post('/screenshot', screenshotBodyLimit, async (c) => {
