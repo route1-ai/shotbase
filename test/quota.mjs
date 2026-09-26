@@ -145,10 +145,11 @@ try {
   assert((await shot(B, nextStatic(), null, AI)).status === 400, 'AI @24 < 25, capture ok → AI request allowed')
 
   state.ai = 25
+  // ai_extract ONLY (no include_text, no image to serve) → keep the hard 429 (case 3).
   const aiOver = await shot(B, nextStatic(), null, AI)
   assert(aiOver.status === 429 && aiOver.body.error === 'Monthly AI extraction quota exceeded'
     && aiOver.body.quota_type === 'ai_extractions' && aiOver.body.limit === 25 && aiOver.body.used === 25,
-    `AI @25 → 429 AI quota (error="${aiOver.body.error}", quota_type=${aiOver.body.quota_type}, limit=${aiOver.body.limit})`)
+    `AI-only @25 → hard 429 AI quota (error="${aiOver.body.error}", quota_type=${aiOver.body.quota_type}, limit=${aiOver.body.limit})`)
 
   // AI exhausted but request has NO ai / all-false ai → capture-only → allowed
   assert((await shot(B, nextStatic())).status === 400, 'AI exhausted, plain capture (no ai_extract) → allowed (AI quota not checked)')
@@ -159,18 +160,28 @@ try {
   assert((await shot(B, nextStatic(), null, { include_text: true })).status === 400,
     'AI exhausted, include_text:true → allowed (include_text does not use AI quota)')
 
+  // include_text + ai_extract, AI exhausted, capture OK → DEGRADE, not 429 (case 2).
+  // It proceeds past the AI gate to capture (SSRF-localhost blocks here → 400, not 429).
+  // On a real URL this is 200 with text, ai_data:null, ai_skipped:"monthly_quota_exceeded".
+  const degrade = await shot(B, nextStatic(), null, { include_text: true, ai_extract: { page_type: true } })
+  assert(degrade.status === 400 && degrade.body.error === 'Blocked URL',
+    `include_text + ai_extract, AI exhausted → degrades (NOT 429; reached capture, got ${degrade.status})`)
+
   // Capture exhausted takes precedence over AI exhausted
   state.capture = 250; state.ai = 25
   const both = await shot(B, nextStatic(), null, AI)
   assert(both.status === 429 && both.body.quota_type === 'captures',
     `both exhausted + AI request → capture quota wins (quota_type=${both.body.quota_type})`)
 
-  // ── MCP dual quota ─────────────────────────────────────────────────────────
-  console.log('── MCP extract=true needs BOTH quotas; extract=false needs only capture ──')
+  // ── MCP quota: capture is a hard gate; AI degrades gracefully ──────────────
+  console.log('── MCP: extract=true with AI exhausted DEGRADES (serves image, skips AI); capture-exhausted still blocks ──')
   state.capture = 5; state.ai = 25
+  // AI exhausted + capture OK: NOT rejected for AI quota — proceeds to capture (here
+  // the SSRF-localhost target blocks it, proving it got PAST the AI-quota gate). On a
+  // real URL this returns the image + an "ai_skipped: monthly_quota_exceeded" marker.
   const mAiBlock = await mcp(B, nextStatic(), null, true)
-  assert(mAiBlock.isError === true && /Monthly AI extraction quota exceeded/.test(mAiBlock.text),
-    `MCP extract=true, AI exhausted → isError AI quota "${mAiBlock.text.slice(0, 45)}"`)
+  assert(mAiBlock.isError === true && /Blocked URL/.test(mAiBlock.text) && !/AI extraction quota/.test(mAiBlock.text),
+    `MCP extract=true, AI exhausted → NOT AI-429; degrades past the AI gate to capture ("${mAiBlock.text.slice(0, 40)}")`)
   const mCapOk = await mcp(B, nextStatic(), null, false)
   assert(mCapOk.isError === true && /Blocked URL/.test(mCapOk.text),
     `MCP extract=false, AI exhausted, capture ok → allowed (reaches SSRF, "${mCapOk.text.slice(0, 30)}")`)
