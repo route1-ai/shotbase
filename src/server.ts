@@ -517,6 +517,7 @@ interface CaptureOpts {
   darkMode?: boolean           // colorScheme 'dark' on the context
   deviceScaleFactor?: number   // 1–3, passed to newContext
   captureImage?: boolean       // false → data mode (skip the screenshot entirely)
+  skipAi?: boolean             // AI requested but monthly quota exhausted → skip Bedrock, still serve the capture/text
 }
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
@@ -871,6 +872,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const darkMode = opts.darkMode === true
   const deviceScaleFactor = Math.min(3, Math.max(1, opts.deviceScaleFactor ?? 1))
   const captureImage = opts.captureImage !== false // default true; false = REST data mode
+  const skipAi = opts.skipAi === true // AI requested but quota exhausted → skip Bedrock, still capture
   // An ai_extract object where every value is false (or {}) is NOT an AI request:
   // don't extract text for it, don't invoke Bedrock, don't consume AI quota.
   const aiRequested = !!aiExtract && Object.values(aiExtract).some((v) => v === true)
@@ -1081,7 +1083,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
 
     // Start Bedrock the moment text is available so it overlaps the screenshot; await
     // it after. In data mode there is no screenshot to overlap (Bedrock runs alone).
-    const doBedrock = aiRequested && !!aiExtract && !!bedrockClient && !!pageText
+    const doBedrock = aiRequested && !skipAi && !!aiExtract && !!bedrockClient && !!pageText
     const bedrockPromise = doBedrock
       ? runBedrockExtraction(aiExtract as Record<string, boolean>, pageText as string)
       : Promise.resolve<{ aiData?: Record<string, unknown>; aiError?: string; ms: number }>({ ms: 0 })
@@ -1295,23 +1297,35 @@ async function getUserPlan(userId: string): Promise<string | null> {
   }
 }
 
+// Usage numbers read during the quota check, reused to build the response quota
+// headers (no extra Supabase round trips). aiUsage/aiLimit are null when the request
+// did not ask for AI (that count is only read when aiRequested).
+interface QuotaUsage { captureUsage: number; captureLimit: number; aiUsage: number | null; aiLimit: number | null }
 type QuotaResult =
-  | { ok: true; plan: CanonicalPlan }
-  | { ok: false; kind: 'quota'; quotaType: 'captures' | 'ai_extractions'; plan: CanonicalPlan; limit: number; used: number }
+  | { ok: true; plan: CanonicalPlan; aiExhausted: boolean; usage: QuotaUsage }
+  | { ok: false; kind: 'quota'; quotaType: 'captures'; plan: CanonicalPlan; limit: number; used: number }
   | { ok: false; kind: 'accounting' }
 // Resolve the effective, normalized plan AND enforce the monthly caps in one place,
 // returning the plan for rate limiting. For a playground (bypass) caller the REAL
 // plan lives in Supabase users.plan (the bypass authenticates as a generic 'pro'
 // placeholder — a Free user must NOT inherit it); that lookup runs IN PARALLEL with
 // the capture-usage count, so a bypass request is one round-trip instead of two.
-// The X-Shotbase-User-Id header is never trusted for plan. Capture quota is always
-// checked; AI quota only when the request asks for AI, and it takes second
-// precedence. Any required query failing → accounting failure (fail closed).
-// Supabase unset → quota disabled, plan from the (normalized) key. NOTE: non-atomic
-// (count → serve → fire-and-forget log), so concurrent requests at the boundary can
-// overshoot by up to the number of in-flight captures.
+// The X-Shotbase-User-Id header is never trusted for plan.
+//
+// CAPTURE quota is a hard gate (over → ok:false, the caller 429s). AI quota is NOT:
+// when the capture quota is fine but AI is exhausted we return ok:true with
+// aiExhausted=true and let the caller decide whether to degrade (serve the
+// capture/text, skip AI) or 429 — so a full AI budget never blocks a plain capture.
+// Any required query failing → accounting failure (fail closed). Supabase unset →
+// quota disabled, plan from the (normalized) key. NOTE: non-atomic (count → serve →
+// fire-and-forget log), so concurrent requests at the boundary can overshoot.
 async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string, aiRequested: boolean): Promise<QuotaResult> {
-  if (!supabase) return { ok: true, plan: normalizePlan(keyResult.plan) } // quota disabled
+  if (!supabase) {
+    // Quota disabled (dev/self-host): no counts to read. Report limits with usage 0
+    // so the headers show a full budget rather than nothing.
+    const plan = normalizePlan(keyResult.plan)
+    return { ok: true, plan, aiExhausted: false, usage: { captureUsage: 0, captureLimit: getCaptureQuota(plan), aiUsage: aiRequested ? 0 : null, aiLimit: aiRequested ? getAiExtractionQuota(plan) : null } }
+  }
 
   const [planRaw, captureUsage] = await Promise.all([
     keyResult.viaBypass ? getUserPlan(ownerId) : Promise.resolve<string | null>(keyResult.plan),
@@ -1325,15 +1339,33 @@ async function checkMonthlyQuota(keyResult: UnkeyResult, ownerId: string, aiRequ
     return { ok: false, kind: 'quota', quotaType: 'captures', plan, limit: captureLimit, used: captureUsage }
   }
 
+  let aiUsage: number | null = null
+  let aiLimit: number | null = null
+  let aiExhausted = false
   if (aiRequested) {
-    const aiUsage = await getMonthlyAiUsage(ownerId)
+    aiUsage = await getMonthlyAiUsage(ownerId)
     if (aiUsage === null) return { ok: false, kind: 'accounting' }
-    const aiLimit = getAiExtractionQuota(plan)
-    if (aiUsage >= aiLimit) {
-      return { ok: false, kind: 'quota', quotaType: 'ai_extractions', plan, limit: aiLimit, used: aiUsage }
-    }
+    aiLimit = getAiExtractionQuota(plan)
+    aiExhausted = aiUsage >= aiLimit
   }
-  return { ok: true, plan }
+  return { ok: true, plan, aiExhausted, usage: { captureUsage, captureLimit, aiUsage, aiLimit } }
+}
+
+// Next monthly reset as a unix epoch (start of next UTC month), for X-Shotbase-Quota-Reset.
+function monthlyResetEpoch(): number {
+  const n = new Date()
+  return Math.floor(Date.UTC(n.getUTCFullYear(), n.getUTCMonth() + 1, 1) / 1000)
+}
+// Quota headers for a successful response, from the counts checkMonthlyQuota already
+// read — NO extra Supabase round trips. AI-Remaining is only emitted when AI usage
+// was actually read (i.e. the request asked for AI); a plain capture never reads it.
+function quotaHeaders(u: QuotaUsage): Record<string, string> {
+  const h: Record<string, string> = {
+    'X-Shotbase-Captures-Remaining': String(Math.max(0, u.captureLimit - u.captureUsage)),
+    'X-Shotbase-Quota-Reset': String(monthlyResetEpoch()),
+  }
+  if (u.aiLimit !== null && u.aiUsage !== null) h['X-Shotbase-AI-Remaining'] = String(Math.max(0, u.aiLimit - u.aiUsage))
+  return h
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -1526,16 +1558,28 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     if (quota.kind === 'accounting') {
       return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
     }
-    const isAi = quota.quotaType === 'ai_extractions'
+    // Capture quota exhausted → hard 429 (unchanged body; frontend branches on quota_type).
     return c.json(
-      {
-        error: isAi ? 'Monthly AI extraction quota exceeded' : 'Monthly capture quota exceeded',
-        quota_type: quota.quotaType,
-        limit: quota.limit,
-        used: quota.used,
-      },
+      { error: 'Monthly capture quota exceeded', quota_type: quota.quotaType, limit: quota.limit, used: quota.used },
       429,
     )
+  }
+
+  // Quota headers for every successful response (built from counts already read).
+  const qHeaders = quotaHeaders(quota.usage)
+
+  // ── AI-quota exhausted, capture quota OK → degrade gracefully by request shape ──
+  // Only ai_extract, nothing else to serve (no image in data mode, no text): keep the
+  // hard 429 verbatim. Otherwise skip AI and serve the rest (with an ai_skipped marker).
+  let aiSkipped = false
+  if (aiRequested && quota.aiExhausted) {
+    if (!includeText) {
+      return c.json(
+        { error: 'Monthly AI extraction quota exceeded', quota_type: 'ai_extractions', limit: quota.usage.aiLimit, used: quota.usage.aiUsage },
+        429,
+      )
+    }
+    aiSkipped = true // include_text present → serve the text, skip the (exhausted) AI call
   }
 
   // ── Capture (shared core) ──────────────────────────────────────────────────
@@ -1544,6 +1588,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   const r = await performCapture({
     url, format, fullPage, width, height, includeText, aiExtract, ownerId,
     waitUntil, delayMs, blockAds, removePopups, darkMode, deviceScaleFactor, captureImage,
+    skipAi: aiSkipped,
   })
   if (!r.ok) {
     if (r.kind === 'ssrf') return c.json({ error: 'Blocked URL', detail: r.message }, 400)
@@ -1575,15 +1620,17 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
       render_time_ms: r.renderTime,
       cached: r.cached,
       text: includeText ? r.pageText : undefined,
-      ai_data: aiRequested ? (r.aiData ?? null) : undefined,
-      ai_error: (aiRequested && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
+      // AI skipped because the monthly AI budget is spent (capture still served + counted).
+      ai_data: aiRequested ? (aiSkipped ? null : (r.aiData ?? null)) : undefined,
+      ai_skipped: (aiRequested && aiSkipped) ? 'monthly_quota_exceeded' : undefined,
+      ai_error: (aiRequested && !aiSkipped && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
       fallback_used: r.fallbackUsed ?? false,
       timings: r.timings,
-    }, 200, { 'Server-Timing': serverTiming })
+    }, 200, { 'Server-Timing': serverTiming, ...qHeaders })
   }
 
   if (r.cached) {
-    return c.body(new Uint8Array(r.buffer), 200, { 'Content-Type': r.contentType, 'X-Cache': 'HIT', 'Server-Timing': serverTiming })
+    return c.body(new Uint8Array(r.buffer), 200, { 'Content-Type': r.contentType, 'X-Cache': 'HIT', 'Server-Timing': serverTiming, ...qHeaders })
   }
   const imgHeaders: Record<string, string> = {
     'Content-Type': r.contentType,
@@ -1591,6 +1638,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     'X-Render-Time': String(r.renderTime),
     'X-Nav-Fallback': String(r.fallbackUsed ?? false),
     'Server-Timing': serverTiming,
+    ...qHeaders,
   }
   // Additive full-page scroll diagnostics (only present when the prepass ran).
   if (r.scrollDiag) {
@@ -1711,16 +1759,17 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
       const extract  = args.extract !== false // default true
 
       // Effective plan + monthly quota (Supabase; AFTER rate limiting). Returns the
-      // real plan for playground bypass — never the 'pro' placeholder.
+      // real plan for playground bypass — never the 'pro' placeholder. AI-quota
+      // exhaustion is NOT a hard fail here: MCP returns an image, so we serve it and
+      // just skip the (exhausted) extraction — the "image + ai_extract" case.
       const quota = await checkMonthlyQuota(keyResult, owner.ownerId, extract)
       if (!quota.ok) {
         const text = quota.kind === 'accounting'
           ? 'Usage temporarily unavailable'
-          : quota.quotaType === 'ai_extractions'
-            ? `Monthly AI extraction quota exceeded. ${quota.plan} plan allows ${quota.limit} AI extractions/month (used ${quota.used}).`
-            : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
+          : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
         return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
       }
+      const mcpAiSkipped = extract && quota.aiExhausted // capture OK, AI budget spent → skip AI, still serve image
 
       const viewport = (args.viewport ?? {}) as { width?: number; height?: number }
       const r = await performCapture({
@@ -1733,6 +1782,7 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
         aiExtract: extract ? { page_type: true, headings: true, ctas: true, prices: true } : undefined,
         ownerId: owner.ownerId,
         captureImage: true, // MCP always returns the image
+        skipAi: mcpAiSkipped,
       })
 
       if (!r.ok) {
@@ -1750,7 +1800,10 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
       ]
       const out: Record<string, unknown> = { content, isError: false }
       if (extract) {
-        if (r.aiData) {
+        if (mcpAiSkipped) {
+          // AI budget spent this month — image served + counted, extraction skipped.
+          content.push({ type: 'text', text: 'ai_skipped: monthly_quota_exceeded' })
+        } else if (r.aiData) {
           content.push({ type: 'text', text: JSON.stringify(r.aiData) })
           out.structuredContent = r.aiData
         } else {
@@ -1760,7 +1813,10 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
           content.push({ type: 'text', text: `extraction_unavailable: ${AI_EXTRACT_UNAVAILABLE_MSG}` })
         }
       }
-      return c.json(rpcResult(id, out))
+      // Quota headers on the successful response; flag a skipped extraction.
+      const mcpHeaders = quotaHeaders(quota.usage)
+      if (mcpAiSkipped) mcpHeaders['X-Shotbase-AI-Skipped'] = 'monthly_quota_exceeded'
+      return c.json(rpcResult(id, out), 200, mcpHeaders)
     }
 
     default:
