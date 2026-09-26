@@ -96,6 +96,22 @@ try {
     failMode = false
     assert(r.status === 503 && r.body?.error === 'Usage temporarily unavailable', `count query fails → 503 (${r.status} ${JSON.stringify(r.body)})`)
   }
+
+  // 5) /quota has its OWN looser bucket — NOT the capture bucket ─────────────────
+  // Free plan caps captures at 10 rpm. If /quota shared that bucket it would 429 by
+  // the 11th call; its own QUOTA_RPM(=60) ceiling means a burst well past 10 still
+  // 200s, and a bigger burst eventually 429s (looser, but not unlimited/exempt).
+  {
+    const QUOTA_RPM = 60
+    const statuses = []
+    for (let i = 0; i < QUOTA_RPM + 15; i++) statuses.push((await quota(KEY)).status)
+    const first12 = statuses.slice(0, 12)
+    assert(first12.every((s) => s === 200), `first 12 rapid /quota calls all 200 → NOT the 10-rpm capture bucket (${first12.join(',')})`)
+    assert(statuses.includes(429), `a bigger burst eventually 429s → looser ceiling exists, not exempt (200s=${statuses.filter((s) => s === 200).length}, 429s=${statuses.filter((s) => s === 429).length})`)
+    const r429 = await fetch(`${B}/quota`, { headers: { Authorization: `Bearer ${KEY}` } })
+    const j429 = await r429.json().catch(() => null)
+    assert(r429.status === 429 && /\/quota allows 60 requests\/minute/.test(j429?.error || ''), `429 body names the /quota-specific limit (${JSON.stringify(j429)})`)
+  }
 } finally { cleanup() }
 
 console.log(`\n${pass} passed, ${fail} failed`)

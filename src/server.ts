@@ -366,8 +366,8 @@ const inMemoryRateLimit = new Map<string, { count: number; reset: number }>()
 // resolved user id for playground (bypass) callers, so one playground user cannot
 // exhaust the shared bypass key's bucket and lock out everyone else. Runs BEFORE any
 // Supabase query so a flood of rejected requests never reaches the database.
-async function checkRateLimit(bucketKey: string, plan: string): Promise<boolean> {
-  const limit = getRateLimitPerMinute(plan)
+async function checkRateLimit(bucketKey: string, plan: string, limitOverride?: number): Promise<boolean> {
+  const limit = limitOverride ?? getRateLimitPerMinute(plan)
   const now = Date.now()
 
   if (redis) {
@@ -1456,8 +1456,11 @@ app.get('/health', async (c) => {
 // ─── Quota (read remaining budget without spending a capture) ────────────────────
 // Authenticated, rate-limited, read-only. Returns captures + AI extractions used/
 // limit/remaining and the next reset epoch — so a caller can check its budget
-// without making an ai_extract call just to read a header. Mirrors /screenshot's
-// auth + rate-limit path exactly; NEVER counts a capture.
+// without making an ai_extract call just to read a header. NEVER counts a capture.
+// A read-only budget check is cheap, so /quota gets its own looser per-minute
+// ceiling on a SEPARATE bucket (see the handler) — polling it never competes with
+// the caller's capture/MCP rate limit. Fixed across plans; generous but not unlimited.
+const QUOTA_RPM = 60
 app.get('/quota', async (c) => {
   const authorization = c.req.header('Authorization')
   if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
@@ -1472,11 +1475,13 @@ app.get('/quota', async (c) => {
   if (!owner.ok) return c.json({ error: owner.message }, 401)
   const ownerId = owner.ownerId
 
-  // Rate limit BEFORE any Supabase query (same bucket/plan rules as /screenshot).
+  // Rate limit BEFORE any Supabase query. /quota has its OWN bucket (the `quota:`
+  // prefix keeps it off the capture bucket) with a looser fixed ceiling, so polling
+  // your budget never burns the per-minute capture/MCP budget you're polling about.
   const rlPlan = normalizePlan(keyResult.plan)
-  const rlBucket = keyResult.viaBypass ? `user:${ownerId}` : `key:${apiKey}`
-  if (await checkRateLimit(rlBucket, rlPlan)) {
-    return c.json({ error: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.` }, 429)
+  const rlBucket = keyResult.viaBypass ? `quota:user:${ownerId}` : `quota:key:${apiKey}`
+  if (await checkRateLimit(rlBucket, rlPlan, QUOTA_RPM)) {
+    return c.json({ error: `Rate limit exceeded. /quota allows ${QUOTA_RPM} requests/minute.` }, 429)
   }
 
   const snap = await getQuotaSnapshot(keyResult, ownerId)
