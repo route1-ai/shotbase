@@ -423,6 +423,13 @@ async function logScreenshot(data: {
   cached: boolean
   aiRequested?: boolean  // true only when an AI extraction was actually requested
   aiSucceeded?: boolean  // true only when Bedrock produced an AI result
+  // On a failed capture: the stable code + the clean, user-facing message (never the raw
+  // Playwright error). Persisted so the dashboard Activity log can answer "why did this
+  // fail?" without a live call. NOTE: requires the screenshots.error_code / error_message
+  // columns (ALTER TABLE — see the migration note); until they exist the insert errors,
+  // but this is fire-and-forget so it never affects the response.
+  errorCode?: string
+  errorMessage?: string
 }) {
   if (!supabase) return
   try {
@@ -436,6 +443,8 @@ async function logScreenshot(data: {
       cached: data.cached,
       ai_requested: data.aiRequested ?? false,
       ai_succeeded: data.aiSucceeded ?? false,
+      error_code: data.errorCode ?? null,
+      error_message: data.errorMessage ?? null,
       created_at: new Date().toISOString(),
     })
   } catch (err) {
@@ -1067,7 +1076,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     permit = await browserGate.acquire()
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Server busy'
-    logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
+    logScreenshot({ userId: ownerId, url, format, status: 503, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested, errorCode: 'server_busy', errorMessage: 'Server is at capacity — try again shortly' })
     return { ok: false, kind: 'overloaded', message, retryAfterMs: BROWSER_QUEUE_TIMEOUT_MS || 1000 }
   }
   mark('queueWaitMs', tQueue)
@@ -1107,7 +1116,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     } catch (err) {
       const code = classifyCaptureError(err)
       console.error(`Capture nav error [${code}] for ${hostOf(url)}:`, err instanceof Error ? err.message : 'unknown')
-      logScreenshot({ userId: ownerId, url, format, status: CAPTURE_FAIL_STATUS[code], timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
+      logScreenshot({ userId: ownerId, url, format, status: CAPTURE_FAIL_STATUS[code], timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested, errorCode: code, errorMessage: captureFailMessage(code, hostOf(url)) })
       return { ok: false, kind: 'capture', code, message: captureFailMessage(code, hostOf(url)) }
     }
     mark('navigationMs', tNav)
@@ -1132,7 +1141,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       () => ((document.body?.innerText || '').trim().length > 0) || ((document.body?.childElementCount ?? 0) > 3)
     ).catch(() => true)
     if (!hasContent && !httpErrorPage) {
-      logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
+      logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested, errorCode: 'render_failed', errorMessage: captureFailMessage('render_failed', hostOf(url)) })
       return { ok: false, kind: 'capture', code: 'render_failed', message: captureFailMessage('render_failed', hostOf(url)) }
     }
 
@@ -1311,7 +1320,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     // classified above. Raw error stays server-side; caller gets a generic render_failed.
     const msg = err instanceof Error ? err.message : 'Unknown error'
     console.error('Screenshot error:', msg)
-    logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
+    logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested, errorCode: 'render_failed', errorMessage: captureFailMessage('render_failed', hostOf(url)) })
     return { ok: false, kind: 'capture', code: 'render_failed', message: captureFailMessage('render_failed', hostOf(url)) }
   } finally {
     if (context) await context.close().catch(() => {})
