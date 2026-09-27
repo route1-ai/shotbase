@@ -481,35 +481,40 @@ function isPrivateIp(ip: string): boolean {
   return false
 }
 
-async function validateSafeUrl(raw: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+// Failure kind distinguishes a genuine resolve-failure ('dns' → the caller typo'd a
+// domain → dns_failed/400) from a security refusal ('blocked' → scheme, credentials,
+// internal hostname, or a public name resolving into private space → blocked_url/400).
+// They MUST stay distinct: a private-IP block should read as a security refusal, never
+// as "domain not found".
+async function validateSafeUrl(raw: string): Promise<{ ok: true } | { ok: false; kind: 'dns' | 'blocked'; reason: string }> {
   let u: URL
-  try { u = new URL(raw) } catch { return { ok: false, reason: 'Malformed URL' } }
+  try { u = new URL(raw) } catch { return { ok: false, kind: 'blocked', reason: 'Malformed URL' } }
 
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    return { ok: false, reason: `Unsupported scheme "${u.protocol}" — only http/https` }
+    return { ok: false, kind: 'blocked', reason: `Unsupported scheme "${u.protocol}" — only http/https` }
   }
-  if (u.username || u.password) return { ok: false, reason: 'URLs with embedded credentials are not allowed' }
+  if (u.username || u.password) return { ok: false, kind: 'blocked', reason: 'URLs with embedded credentials are not allowed' }
 
   const host = u.hostname.toLowerCase()
   if (host === 'localhost' || host.endsWith('.localhost') ||
       host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.cluster.local')) {
-    return { ok: false, reason: `Blocked internal hostname "${host}"` }
+    return { ok: false, kind: 'blocked', reason: `Blocked internal hostname "${host}"` }
   }
   // IP literal in the host → check directly
   const literal = host.replace(/^\[|\]$/g, '')
   if (/^[\d.]+$/.test(literal) || literal.includes(':')) {
-    if (isPrivateIp(literal)) return { ok: false, reason: `Blocked private/reserved IP "${literal}"` }
+    if (isPrivateIp(literal)) return { ok: false, kind: 'blocked', reason: `Blocked private/reserved IP "${literal}"` }
     return { ok: true }
   }
   // Hostname → resolve and check EVERY address (defends against DNS pointing at private space)
   try {
     const addrs = await lookup(host, { all: true })
-    if (addrs.length === 0) return { ok: false, reason: `Hostname "${host}" did not resolve` }
+    if (addrs.length === 0) return { ok: false, kind: 'dns', reason: `Hostname "${host}" did not resolve` }
     for (const { address } of addrs) {
-      if (isPrivateIp(address)) return { ok: false, reason: `Hostname "${host}" resolves to private IP ${address}` }
+      if (isPrivateIp(address)) return { ok: false, kind: 'blocked', reason: `Hostname "${host}" resolves to private IP ${address}` }
     }
   } catch {
-    return { ok: false, reason: `Could not resolve hostname "${host}"` }
+    return { ok: false, kind: 'dns', reason: `Could not resolve hostname "${host}"` }
   }
   return { ok: true }
 }
@@ -542,13 +547,52 @@ interface CaptureOpts {
   extraHeaders?: Record<string, string> // custom request headers sent to the target
   targetAuthorization?: string          // an Authorization value meant for the TARGET page
 }
+// Stable, machine-readable failure codes for a page that can't be rendered. The
+// frontend branches on `code`, never on the message text. Each maps to a fixed HTTP
+// status. Messages are built to be genuinely useful to a developer (they include the
+// caller's own hostname — that's their input, not a leak); the raw Playwright error is
+// logged server-side only, never returned.
+type CaptureFailCode = 'dns_failed' | 'connection_refused' | 'navigation_timeout' | 'ssl_error' | 'render_failed'
+export const CAPTURE_FAIL_STATUS = {
+  dns_failed: 400,          // domain doesn't resolve → caller typo
+  connection_refused: 502,  // resolved, but the host refused/reset the connection
+  navigation_timeout: 504,  // the page never finished loading within NAV_TIMEOUT_MS
+  ssl_error: 502,           // invalid / expired TLS certificate
+  render_failed: 500,       // anything else that prevented a usable render
+} as const satisfies Record<CaptureFailCode, number>
+export function captureFailMessage(code: CaptureFailCode, host: string): string {
+  switch (code) {
+    case 'dns_failed':         return `Domain not found: ${host}`
+    case 'connection_refused': return `Could not connect to ${host} — the server refused the connection`
+    case 'navigation_timeout': return `Timed out loading ${host}`
+    case 'ssl_error':          return `${host} has an invalid or expired SSL certificate`
+    case 'render_failed':      return `The page at ${host} could not be rendered`
+  }
+}
+// Classify a raw Playwright/Chromium navigation error into a stable code. Exported so it
+// can be unit-tested against the exact error strings without needing to trigger real
+// network failures (which can't be produced deterministically against a local target).
+export function classifyCaptureError(err: unknown): CaptureFailCode {
+  const msg = err instanceof Error ? err.message : String(err ?? '')
+  if (/ERR_NAME_NOT_RESOLVED/.test(msg)) return 'dns_failed'
+  if (/ERR_CERT|ERR_SSL|SSL_VERSION|ERR_BAD_SSL/i.test(msg)) return 'ssl_error'
+  if (/ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_CONNECTION_ABORTED|ERR_CONNECTION_FAILED|ERR_ADDRESS_UNREACHABLE|ERR_EMPTY_RESPONSE|ERR_SOCKET_NOT_CONNECTED/i.test(msg)) return 'connection_refused'
+  if (/Timeout.*exceeded|TimeoutError/i.test(msg)) return 'navigation_timeout'
+  return 'render_failed'
+}
+function hostOf(rawUrl: string): string {
+  try { return new URL(rawUrl).host } catch { return rawUrl }
+}
+
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
       renderTime: number; cached: boolean; pageText: string | null; aiData?: Record<string, unknown>; aiError?: string
-      timings?: Record<string, number>; fallbackUsed?: boolean
+      timings?: Record<string, number>; fallbackUsed?: boolean; pageStatus?: number | null
       scrollDiag?: (ScrollDiag & { error?: boolean })
       fixedOverlay?: { detected: boolean; height: number; composited: boolean; ms: number } }
-  | { ok: false; kind: 'ssrf' | 'capture' | 'overloaded'; message: string; retryAfterMs?: number }
+  | { ok: false; kind: 'ssrf'; message: string }
+  | { ok: false; kind: 'overloaded'; message: string; retryAfterMs?: number }
+  | { ok: false; kind: 'capture'; code: CaptureFailCode; message: string }
 
 // ─── Bounded navigation strategy (render reliability) ────────────────────────────
 // networkidle never settles on pages with continuous background traffic (ads,
@@ -946,11 +990,16 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const timings: Record<string, number> = {}
   const mark = (k: string, from: number) => { timings[k] = Date.now() - from }
 
-  // SSRF guard (incl. DNS resolution) — fail fast before touching the browser
+  // SSRF guard (incl. DNS resolution) — fail fast before touching the browser.
+  // A resolve-failure here is a real "domain not found" (dns_failed/400), NOT a security
+  // block; a private-IP / internal-host refusal stays a distinct blocked_url refusal.
   const tValidate = Date.now()
   const safe = await validateSafeUrl(url)
   mark('validationMs', tValidate)
-  if (!safe.ok) return { ok: false, kind: 'ssrf', message: safe.reason }
+  if (!safe.ok) {
+    if (safe.kind === 'dns') return { ok: false, kind: 'capture', code: 'dns_failed', message: captureFailMessage('dns_failed', hostOf(url)) }
+    return { ok: false, kind: 'ssrf', message: safe.reason }
+  }
 
   // Cache keys — MUST include every render-affecting parameter so different options
   // never collide. Image cache stores the binary; data cache stores the JSON result.
@@ -1049,7 +1098,18 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     // never goes network-quiet must still be captured with whatever has rendered.
     const tNav = Date.now()
     const gotoWait: WaitUntil = (waitUntil === 'load' || waitUntil === 'domcontentloaded' || waitUntil === 'commit') ? waitUntil : 'load'
-    await page.goto(url, { waitUntil: gotoWait, timeout: NAV_TIMEOUT_MS })
+    // Wrap goto specifically so a NAVIGATION failure (DNS/refused/timeout/TLS) maps to a
+    // precise code, distinct from a post-navigation render error (→ render_failed below).
+    let pageStatus: number | null = null
+    try {
+      const resp = await page.goto(url, { waitUntil: gotoWait, timeout: NAV_TIMEOUT_MS })
+      pageStatus = resp?.status() ?? null
+    } catch (err) {
+      const code = classifyCaptureError(err)
+      console.error(`Capture nav error [${code}] for ${hostOf(url)}:`, err instanceof Error ? err.message : 'unknown')
+      logScreenshot({ userId: ownerId, url, format, status: CAPTURE_FAIL_STATUS[code], timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
+      return { ok: false, kind: 'capture', code, message: captureFailMessage(code, hostOf(url)) }
+    }
     mark('navigationMs', tNav)
     const tSettle = Date.now()
     if (waitUntil === undefined) {
@@ -1064,12 +1124,16 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
     mark('settleMs', tSettle)
 
     // ── Meaningful-content guard: only discard if the page produced ~nothing. ──
+    // Exception: if the TARGET returned an HTTP error (4xx/5xx), an empty-ish error page
+    // is still a valid capture — serve it (with X-Shotbase-Page-Status) rather than
+    // discarding it as a render failure.
+    const httpErrorPage = pageStatus != null && pageStatus >= 400
     const hasContent = await page.evaluate(
       () => ((document.body?.innerText || '').trim().length > 0) || ((document.body?.childElementCount ?? 0) > 3)
     ).catch(() => true)
-    if (!hasContent) {
+    if (!hasContent && !httpErrorPage) {
       logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
-      return { ok: false, kind: 'capture', message: 'Navigation completed but page produced no content' }
+      return { ok: false, kind: 'capture', code: 'render_failed', message: captureFailMessage('render_failed', hostOf(url)) }
     }
 
     // ── Popup / cookie-banner DOM cleanup (remove_popups) ──────────────────────
@@ -1236,15 +1300,19 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
       else boundedCacheSet(cacheMap, cacheKey, { buffer, format, timestamp: now }, now)
     }
     mark('cacheWriteMs', tCacheWrite)
+    // NOTE: a rendered 4xx/5xx page reaches here and is logged status:200 — it IS a
+    // served capture and therefore COUNTS against capture quota (see X-Shotbase-Page-Status).
     logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false, aiRequested, aiSucceeded })
 
-    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed, scrollDiag,
+    return { ok: true, buffer, contentType, format, width, height, renderTime, cached: false, pageText, aiData, aiError, timings, fallbackUsed, pageStatus, scrollDiag,
       fixedOverlay: wantFixedOverlay ? { detected: fixedOverlayDetected, height: fixedOverlayHeight, composited: fixedOverlayComposited, ms: fixedOverlayMs } : undefined }
   } catch (err) {
+    // Post-navigation failure (screenshot/evaluate/etc.) — navigation errors are already
+    // classified above. Raw error stays server-side; caller gets a generic render_failed.
     const msg = err instanceof Error ? err.message : 'Unknown error'
     console.error('Screenshot error:', msg)
     logScreenshot({ userId: ownerId, url, format, status: 500, timeMs: Date.now() - startTime, sizeKb: 0, cached: false, aiRequested })
-    return { ok: false, kind: 'capture', message: msg }
+    return { ok: false, kind: 'capture', code: 'render_failed', message: captureFailMessage('render_failed', hostOf(url)) }
   } finally {
     if (context) await context.close().catch(() => {})
     permit.release() // ALWAYS — success, capture error, or browser crash/relaunch
@@ -1784,20 +1852,30 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     skipAi: aiSkipped,
   })
   if (!r.ok) {
-    if (r.kind === 'ssrf') return c.json({ error: 'Blocked URL', detail: r.message }, 400)
+    // Every error body carries a stable `code` the frontend branches on (never the text).
+    // A security refusal stays distinct from a resolve-failure: blocked_url vs dns_failed.
+    if (r.kind === 'ssrf') return c.json({ error: 'Blocked URL', detail: r.message, code: 'blocked_url' }, 400)
     if (r.kind === 'overloaded') {
       return c.json(
-        { error: 'Server busy', detail: r.message },
+        { error: 'Server busy', detail: r.message, code: 'server_busy' },
         503,
         { 'Retry-After': String(Math.ceil((r.retryAfterMs ?? 1000) / 1000)) },
       )
     }
-    return c.json({ error: 'Screenshot failed', detail: r.message }, 500)
+    // Render/navigation failure: helpful message (incl. the caller's own hostname) + code.
+    // The raw Playwright error is logged server-side only, never returned.
+    return c.json({ error: r.message, code: r.code }, CAPTURE_FAIL_STATUS[r.code])
   }
 
   // ── Server-Timing (success responses only) ──────────────────────────────────
   const serverTiming = buildServerTiming({ ...stage, ...captureStageTimings(r.timings) })
   console.log(`[timing] ${url} cache=${r.cached ? 'HIT' : 'MISS'} ${serverTiming}`)
+
+  // The target returned an HTTP error but rendered a page → this is still a valid 200
+  // capture; surface the target's status so the caller can distinguish "your site 404'd"
+  // from "our API failed". (A fresh capture only; cache hits don't carry it.)
+  const pageStatusHeaders: Record<string, string> =
+    (r.pageStatus != null && r.pageStatus >= 400) ? { 'X-Shotbase-Page-Status': String(r.pageStatus) } : {}
 
   // Preserve existing behavior: a Bedrock failure during ai_extract is a 500.
   // JSON response for text/AI modes. A Bedrock failure no longer discards the
@@ -1818,8 +1896,9 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
       ai_skipped: (aiRequested && aiSkipped) ? 'monthly_quota_exceeded' : undefined,
       ai_error: (aiRequested && !aiSkipped && r.aiError) ? AI_EXTRACT_UNAVAILABLE_MSG : undefined,
       fallback_used: r.fallbackUsed ?? false,
+      page_status: (r.pageStatus != null && r.pageStatus >= 400) ? r.pageStatus : undefined,
       timings: r.timings,
-    }, 200, { 'Server-Timing': serverTiming, ...qHeaders })
+    }, 200, { 'Server-Timing': serverTiming, ...qHeaders, ...pageStatusHeaders })
   }
 
   if (r.cached) {
@@ -1832,6 +1911,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
     'X-Nav-Fallback': String(r.fallbackUsed ?? false),
     'Server-Timing': serverTiming,
     ...qHeaders,
+    ...pageStatusHeaders,
   }
   // Additive full-page scroll diagnostics (only present when the prepass ran).
   if (r.scrollDiag) {
@@ -1979,13 +2059,16 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
       })
 
       if (!r.ok) {
+        // Same stable codes as REST (exposed via header for branching); generic, useful
+        // message in the content. Raw Playwright error stays server-side.
+        const code = r.kind === 'ssrf' ? 'blocked_url' : r.kind === 'overloaded' ? 'server_busy' : r.code
         const text = r.kind === 'ssrf' ? `Blocked URL: ${r.message}`
           : r.kind === 'overloaded' ? `Server busy: ${r.message}`
-          : `Capture failed: ${r.message}`
+          : r.message
         return c.json(rpcResult(id, {
-          content: [{ type: 'text', text }],
+          content: [{ type: 'text', text: `${text} (code: ${code})` }],
           isError: true,
-        }))
+        }), 200, { 'X-Shotbase-Error-Code': code })
       }
 
       const content: Array<Record<string, unknown>> = [
@@ -2006,9 +2089,15 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
           content.push({ type: 'text', text: `extraction_unavailable: ${AI_EXTRACT_UNAVAILABLE_MSG}` })
         }
       }
-      // Quota headers on the successful response; flag a skipped extraction.
+      // The target returned an HTTP error but rendered → still a valid capture; surface
+      // its status (header + a content note) so the agent can tell "site 404'd" from "we failed".
+      if (r.pageStatus != null && r.pageStatus >= 400) {
+        content.push({ type: 'text', text: `page_status: ${r.pageStatus}` })
+      }
+      // Quota headers on the successful response; flag a skipped extraction / page status.
       const mcpHeaders = quotaHeaders(quota.usage)
       if (mcpAiSkipped) mcpHeaders['X-Shotbase-AI-Skipped'] = 'monthly_quota_exceeded'
+      if (r.pageStatus != null && r.pageStatus >= 400) mcpHeaders['X-Shotbase-Page-Status'] = String(r.pageStatus)
       return c.json(rpcResult(id, out), 200, mcpHeaders)
     }
 
