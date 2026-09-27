@@ -143,6 +143,18 @@ const MAX_BROWSER_CONCURRENCY  = Math.max(1, Math.floor(Number(process.env.MAX_B
 const MAX_BROWSER_QUEUE        = Math.max(0, Math.floor(Number(process.env.MAX_BROWSER_QUEUE ?? 20)) || 0)
 const BROWSER_QUEUE_TIMEOUT_MS = Math.max(0, Math.floor(Number(process.env.BROWSER_QUEUE_TIMEOUT_MS ?? 10_000)) || 0)
 
+// TEST-ONLY gate occupier (see POST /__gate/occupy). Lets a load test hold browser-gate
+// slots for a bounded time so overflow behaviour is deterministic, WITHOUT capturing
+// anything or touching the SSRF guard. Enabled ONLY when SHOTBASE_TEST_GATE_OCCUPY=1;
+// with the var unset the route is never registered (it does not exist, not a 404 handler).
+// A stray value in production is a HARD BOOT FAILURE, never a silent hole: a test lever
+// that can tie up the browser gate must not survive into a real deploy.
+if (process.env.SHOTBASE_TEST_GATE_OCCUPY != null && process.env.NODE_ENV === 'production') {
+  console.error('FATAL: SHOTBASE_TEST_GATE_OCCUPY is a test-only lever and must never be set with NODE_ENV=production. Refusing to start.')
+  process.exit(1)
+}
+const GATE_OCCUPY_ENABLED = process.env.SHOTBASE_TEST_GATE_OCCUPY === '1'
+
 type GateErrorKind = 'overloaded' | 'timeout'
 export class GateError extends Error {
   kind: GateErrorKind
@@ -1507,6 +1519,48 @@ app.get('/health', async (c) => {
   const ok = healthCache.ok
   return c.json({ status: ok ? 'ok' : 'degraded', service: 'shotbase' }, ok ? 200 : 503)
 })
+
+// ─── TEST-ONLY: browser-gate occupier ────────────────────────────────────────────
+// Registered ONLY when SHOTBASE_TEST_GATE_OCCUPY=1 (see the boot guard above); with the
+// var unset this route does not exist. It acquires a real browser-gate permit and holds
+// it for a bounded time — no capture, no navigation, no SSRF — so a load test can fill
+// the gate deterministically and assert that /screenshot and MCP then return 503. Same
+// API-key auth as every other endpoint (never anonymous); duration hard-capped at 5s
+// server-side; every use logged loudly at warn with the caller.
+if (GATE_OCCUPY_ENABLED) {
+  const GATE_OCCUPY_MAX_MS = 5000
+  app.post('/__gate/occupy', async (c) => {
+    const authorization = c.req.header('Authorization')
+    if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
+    const m = authorization.match(/^Bearer\s+(.+)$/)
+    const apiKey = m?.[1]?.trim()
+    if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>' }, 401)
+    const keyResult = await verifyKey(apiKey)
+    if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
+    const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
+    if (!owner.ok) return c.json({ error: owner.message }, 401)
+
+    let body: Record<string, unknown> | null = null
+    try { body = await c.req.json() } catch { /* stays null */ }
+    const reqMs = Number(body?.ms ?? 0)
+    const ms = Math.min(GATE_OCCUPY_MAX_MS, Math.max(0, Number.isFinite(reqMs) ? Math.floor(reqMs) : 0))
+    console.warn(`[gate-occupy] TEST-ONLY gate occupier used by owner=${owner.ownerId} requested_ms=${body?.ms ?? 0} capped_ms=${ms}`)
+
+    let permit: Permit
+    try {
+      permit = await browserGate.acquire()
+    } catch (err) {
+      // Gate already full → same overload contract as a capture.
+      return c.json(
+        { error: 'Server busy', detail: err instanceof Error ? err.message : 'overloaded' },
+        503,
+        { 'Retry-After': String(Math.ceil((BROWSER_QUEUE_TIMEOUT_MS || 1000) / 1000)) },
+      )
+    }
+    try { await new Promise((r) => setTimeout(r, ms)) } finally { permit.release() }
+    return c.json({ occupied_ms: ms }, 200)
+  })
+}
 
 // ─── Quota (read remaining budget without spending a capture) ────────────────────
 // Authenticated, rate-limited, read-only. Returns captures + AI extractions used/
