@@ -19,6 +19,10 @@ const cacheMap = new Map<string, { buffer: Buffer; format: string; timestamp: nu
 // Data-mode (text / ai_extract JSON) results are cached separately from images.
 const dataCacheMap = new Map<string, { pageText: string | null; aiData?: Record<string, unknown>; aiError?: string; timestamp: number }>()
 const CACHE_TTL_MS = 60 * 1000
+// The in-memory maps (used only when Redis is absent) have no TTL and no eviction of
+// their own, so without a bound they grow without limit on the fallback path. Cap the
+// number of live entries; boundedCacheSet evicts oldest-first once the cap is hit.
+const MAX_MEMORY_CACHE_ENTRIES = 500
 
 if (process.env.REDIS_URL) {
   redis = new Redis(process.env.REDIS_URL)
@@ -518,6 +522,13 @@ interface CaptureOpts {
   deviceScaleFactor?: number   // 1–3, passed to newContext
   captureImage?: boolean       // false → data mode (skip the screenshot entirely)
   skipAi?: boolean             // AI requested but monthly quota exhausted → skip Bedrock, still serve the capture/text
+  // Per-viewer auth material for the TARGET page. NOT populated by any route today
+  // (cookie/header passthrough isn't shipped) — declared now so the cache guard
+  // exists the day it is. Any of these makes the render viewer-specific, so
+  // carriesTargetAuthMaterial() forces a cache bypass (see the cache-key comment).
+  cookies?: unknown                     // cookies injected into the target context
+  extraHeaders?: Record<string, string> // custom request headers sent to the target
+  targetAuthorization?: string          // an Authorization value meant for the TARGET page
 }
 type CaptureResult =
   | { ok: true; buffer: Buffer; contentType: string; format: string; width: number; height: number
@@ -863,6 +874,45 @@ async function runBedrockExtraction(
   }
 }
 
+// Does this capture carry per-viewer auth material for the TARGET page — anything
+// that makes the page render differently for one caller than another (cookies, custom
+// request headers, an Authorization meant for the target)? The capture cache key is
+// deliberately caller-agnostic (url + render options only — see performCapture), so a
+// viewer-specific render MUST NOT be cached: doing so would serve one customer's
+// authenticated page to the next caller of the same URL. True → bypass cache read AND
+// write, render fresh. Nothing populates these fields today, so this returns false for
+// every current request and the cache behaves exactly as before.
+export function carriesTargetAuthMaterial(opts: CaptureOpts): boolean {
+  const { cookies, extraHeaders, targetAuthorization } = opts
+  const hasCookies =
+    typeof cookies === 'string' ? cookies.trim().length > 0
+    : Array.isArray(cookies) ? cookies.length > 0
+    : (cookies != null && typeof cookies === 'object') ? Object.keys(cookies as object).length > 0
+    : false
+  const hasHeaders = !!extraHeaders && Object.keys(extraHeaders).length > 0
+  const hasAuth = typeof targetAuthorization === 'string' && targetAuthorization.trim().length > 0
+  return hasCookies || hasHeaders || hasAuth
+}
+
+// Bounded write for an in-memory cache map (the Redis-absent fallback path only).
+// Plain Maps have neither TTL nor eviction, so this keeps them from growing without
+// limit: first sweep entries past CACHE_TTL_MS, then, if a NEW key would exceed the
+// cap, evict oldest-first (Map preserves insertion order), then insert. The Redis
+// path is untouched — setex already bounds it with a 60s TTL.
+export function boundedCacheSet<V extends { timestamp: number }>(
+  map: Map<string, V>, key: string, value: V, now: number, cap = MAX_MEMORY_CACHE_ENTRIES,
+): void {
+  for (const [k, v] of map) { if (now >= v.timestamp + CACHE_TTL_MS) map.delete(k) }
+  if (!map.has(key)) {
+    while (map.size >= cap) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
+  }
+  map.set(key, value)
+}
+
 async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
   const { url, format, fullPage, width, height, includeText, aiExtract, ownerId } = opts
   const waitUntil = opts.waitUntil
@@ -892,13 +942,24 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
 
   // Cache keys — MUST include every render-affecting parameter so different options
   // never collide. Image cache stores the binary; data cache stores the JSON result.
+  //
+  // Caller identity (API key / user / org) is DELIBERATELY absent: identical public
+  // pages requested by different customers are byte-identical, so a shared, caller-
+  // agnostic key is what gives us a cross-customer hit rate. That is only safe while
+  // the render depends solely on (url + render options). The moment a request carries
+  // per-viewer auth material (cookies/headers/authorization for the target page), the
+  // render becomes viewer-specific and this shared key would collide across customers —
+  // serving one customer's authenticated page to another. carriesTargetAuthMaterial()
+  // is the guard: when it is true we bypass the cache entirely (read AND write below),
+  // so such a render is never stored under, nor served from, a caller-agnostic key.
+  const bypassCache = carriesTargetAuthMaterial(opts)
   const renderKey = `${format}:${fullPage}:${width}x${height}:wu=${waitUntil ?? 'def'}:d=${delayMs}:ad${blockAds ? 1 : 0}:pp${removePopups ? 1 : 0}:dk${darkMode ? 1 : 0}:dsf${deviceScaleFactor}`
   const cacheKey = `cache:${CAPTURE_CACHE_VERSION}:${url}:${renderKey}`
   const aiFieldsKey = aiExtract ? Object.keys(aiExtract).filter((k) => aiExtract[k]).sort().join(',') : ''
   const dataCacheKey = `datacache:${CAPTURE_CACHE_VERSION}:${url}:${renderKey}:it${includeText ? 1 : 0}:ai=${aiFieldsKey}`
   const now = Date.now()
 
-  if (useDataCache) {
+  if (useDataCache && !bypassCache) {
     // ── Data-mode cache (text / ai_data JSON), served + logged like an image hit ──
     if (redis) {
       try {
@@ -916,7 +977,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
         return { ok: true, buffer: Buffer.alloc(0), contentType: getContentType(format), format, width, height, renderTime: 0, cached: true, pageText: cd.pageText, aiData: cd.aiData, aiError: cd.aiError, timings }
       }
     }
-  } else if (!includeText && !aiExtract) {
+  } else if (!includeText && !aiExtract && !bypassCache) {
     // ── Image cache (plain capture only) ──
     if (redis) {
       try {
@@ -1153,13 +1214,14 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
 
     // ── Cache write (fire-and-forget for Redis so it never blocks the response) ──
     const tCacheWrite = Date.now()
-    if (useDataCache) {
+    // bypassCache → viewer-specific render: never persist it under a caller-agnostic key.
+    if (useDataCache && !bypassCache) {
       const payload = { pageText, aiData, aiError }
       if (redis) redis.setex(dataCacheKey, 60, JSON.stringify(payload)).catch((err) => console.error('Redis data-cache write error:', err instanceof Error ? err.message : 'unknown'))
-      else dataCacheMap.set(dataCacheKey, { ...payload, timestamp: now })
-    } else if (!includeText && !aiExtract) {
+      else boundedCacheSet(dataCacheMap, dataCacheKey, { ...payload, timestamp: now }, now)
+    } else if (!includeText && !aiExtract && !bypassCache) {
       if (redis) redis.setex(cacheKey, 60, buffer.toString('base64')).catch((err) => console.error('Redis cache write error:', err instanceof Error ? err.message : 'unknown'))
-      else cacheMap.set(cacheKey, { buffer, format, timestamp: now })
+      else boundedCacheSet(cacheMap, cacheKey, { buffer, format, timestamp: now }, now)
     }
     mark('cacheWriteMs', tCacheWrite)
     logScreenshot({ userId: ownerId, url, format, status: 200, timeMs: renderTime, sizeKb: buffer.length / 1024, cached: false, aiRequested, aiSucceeded })
