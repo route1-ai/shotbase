@@ -1366,7 +1366,7 @@ function buildServerTiming(stages: Record<string, number>): string {
 const MAX_BODY_BYTES = Math.max(1024, Math.floor(Number(process.env.MAX_BODY_BYTES ?? 1_048_576)) || 1_048_576)
 const screenshotBodyLimit = bodyLimit({
   maxSize: MAX_BODY_BYTES,
-  onError: (c) => c.json({ error: 'Request body too large', detail: `Max ${MAX_BODY_BYTES} bytes` }, 413),
+  onError: (c) => c.json({ error: 'Request body too large', detail: `Max ${MAX_BODY_BYTES} bytes`, code: 'request_too_large' }, 413),
 })
 const mcpBodyLimit = bodyLimit({
   maxSize: MAX_BODY_BYTES,
@@ -1599,14 +1599,14 @@ if (GATE_OCCUPY_ENABLED) {
   const GATE_OCCUPY_MAX_MS = 5000
   app.post('/__gate/occupy', async (c) => {
     const authorization = c.req.header('Authorization')
-    if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
+    if (!authorization) return c.json({ error: 'Missing Authorization header', code: 'missing_authorization' }, 401)
     const m = authorization.match(/^Bearer\s+(.+)$/)
     const apiKey = m?.[1]?.trim()
-    if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>' }, 401)
+    if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>', code: 'invalid_authorization' }, 401)
     const keyResult = await verifyKey(apiKey)
-    if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
+    if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key', code: 'invalid_api_key' }, 401)
     const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
-    if (!owner.ok) return c.json({ error: owner.message }, 401)
+    if (!owner.ok) return c.json({ error: owner.message, code: 'unauthorized' }, 401)
 
     let body: Record<string, unknown> | null = null
     try { body = await c.req.json() } catch { /* stays null */ }
@@ -1640,16 +1640,16 @@ if (GATE_OCCUPY_ENABLED) {
 const QUOTA_RPM = 60
 app.get('/quota', async (c) => {
   const authorization = c.req.header('Authorization')
-  if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
+  if (!authorization) return c.json({ error: 'Missing Authorization header', code: 'missing_authorization' }, 401)
   const match = authorization.match(/^Bearer\s+(.+)$/)
   const apiKey = match?.[1]?.trim()
-  if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>' }, 401)
+  if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>', code: 'invalid_authorization' }, 401)
 
   const keyResult = await verifyKey(apiKey)
-  if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
+  if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key', code: 'invalid_api_key' }, 401)
 
   const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
-  if (!owner.ok) return c.json({ error: owner.message }, 401)
+  if (!owner.ok) return c.json({ error: owner.message, code: 'unauthorized' }, 401)
   const ownerId = owner.ownerId
 
   // Rate limit BEFORE any Supabase query. /quota has its OWN bucket (the `quota:`
@@ -1658,11 +1658,11 @@ app.get('/quota', async (c) => {
   const rlPlan = normalizePlan(keyResult.plan)
   const rlBucket = keyResult.viaBypass ? `quota:user:${ownerId}` : `quota:key:${apiKey}`
   if (await checkRateLimit(rlBucket, rlPlan, QUOTA_RPM)) {
-    return c.json({ error: `Rate limit exceeded. /quota allows ${QUOTA_RPM} requests/minute.` }, 429)
+    return c.json({ error: `Rate limit exceeded. /quota allows ${QUOTA_RPM} requests/minute.`, code: 'rate_limited' }, 429)
   }
 
   const snap = await getQuotaSnapshot(keyResult, ownerId)
-  if (!snap.ok) return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
+  if (!snap.ok) return c.json({ error: 'Usage temporarily unavailable', code: 'usage_unavailable' }, 503) // accounting dependency failed → fail closed
 
   const reset = monthlyResetEpoch()
   const capRemaining = Math.max(0, snap.captureLimit - snap.captureUsage)
@@ -1686,22 +1686,22 @@ app.get('/quota', async (c) => {
 app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const authorization = c.req.header('Authorization')
-  if (!authorization) return c.json({ error: 'Missing Authorization header' }, 401)
+  if (!authorization) return c.json({ error: 'Missing Authorization header', code: 'missing_authorization' }, 401)
 
   const match = authorization.match(/^Bearer\s+(.+)$/)
   const apiKey = match?.[1]?.trim()
-  if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>' }, 401)
+  if (!apiKey) return c.json({ error: 'Invalid authorization format. Use: Bearer <key>', code: 'invalid_authorization' }, 401)
 
   const stage: Record<string, number> = {}
   const tVerify = Date.now()
   const keyResult = await verifyKey(apiKey)
   stage.verify_key = Date.now() - tVerify
-  if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key' }, 401)
+  if (!keyResult.valid) return c.json({ error: keyResult.error ?? 'Invalid API key', code: 'invalid_api_key' }, 401)
 
   // Attribute to the real user. Bypass callers MUST assert a valid user id or we
   // fail closed (never log as generic "playground"). Non-bypass keys ignore the header.
   const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
-  if (!owner.ok) return c.json({ error: owner.message }, 401)
+  if (!owner.ok) return c.json({ error: owner.message, code: 'unauthorized' }, 401)
   const ownerId = owner.ownerId
 
   // ── Rate limit — BEFORE any Supabase query, so a flood never hits the database ──
@@ -1715,7 +1715,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   const rateLimited = await checkRateLimit(rlBucket, rlPlan)
   stage.rate_limit = Date.now() - tRate
   if (rateLimited) {
-    return c.json({ error: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.` }, 429)
+    return c.json({ error: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.`, code: 'rate_limited' }, 429)
   }
 
   // ── Parse body ──────────────────────────────────────────────────────────────
@@ -1728,59 +1728,59 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // viewport defaults are the backend's existing contract and are intentionally kept.
   const url = body?.url
   if (typeof url !== 'string' || !url.trim()) {
-    return c.json({ error: 'Missing or invalid "url" field' }, 400)
+    return c.json({ error: 'Missing or invalid "url" field', code: 'invalid_url' }, 400)
   }
   if (url.length > 2048) {
-    return c.json({ error: '"url" exceeds the 2048-character limit' }, 400)
+    return c.json({ error: '"url" exceeds the 2048-character limit', code: 'invalid_url' }, 400)
   }
 
   const format = (body?.format ?? 'png') as string
   if (!['png', 'jpeg', 'webp', 'pdf'].includes(format)) {
-    return c.json({ error: 'Invalid "format" — must be one of: png, jpeg, webp, pdf' }, 400)
+    return c.json({ error: 'Invalid "format" — must be one of: png, jpeg, webp, pdf', code: 'invalid_parameter' }, 400)
   }
 
   const fullPage = body?.full_page ?? false
   if (typeof fullPage !== 'boolean') {
-    return c.json({ error: '"full_page" must be a boolean' }, 400)
+    return c.json({ error: '"full_page" must be a boolean', code: 'invalid_parameter' }, 400)
   }
 
   const includeText = body?.include_text ?? false
   if (typeof includeText !== 'boolean') {
-    return c.json({ error: '"include_text" must be a boolean' }, 400)
+    return c.json({ error: '"include_text" must be a boolean', code: 'invalid_parameter' }, 400)
   }
 
   // Viewport — must be integers inside safe render bounds (prevents overflow /
   // pathological allocations). Defaults preserve prior behavior.
   const width = (body?.width ?? 1440) as number
   if (!Number.isInteger(width) || width < 100 || width > 3840) {
-    return c.json({ error: '"width" must be an integer between 100 and 3840' }, 400)
+    return c.json({ error: '"width" must be an integer between 100 and 3840', code: 'invalid_parameter' }, 400)
   }
   const height = (body?.height ?? 900) as number
   if (!Number.isInteger(height) || height < 100 || height > 2160) {
-    return c.json({ error: '"height" must be an integer between 100 and 2160' }, 400)
+    return c.json({ error: '"height" must be an integer between 100 and 2160', code: 'invalid_parameter' }, 400)
   }
 
   // ── Wait strategy + render options (all optional, validated like the rest) ──
   let waitUntil: WaitUntil | undefined
   if (body?.wait_until !== undefined) {
     if (!['load', 'domcontentloaded', 'networkidle', 'commit'].includes(body.wait_until as string)) {
-      return c.json({ error: '"wait_until" must be one of: load, domcontentloaded, networkidle, commit' }, 400)
+      return c.json({ error: '"wait_until" must be one of: load, domcontentloaded, networkidle, commit', code: 'invalid_parameter' }, 400)
     }
     waitUntil = body.wait_until as WaitUntil
   }
   const delayMs = (body?.delay_ms ?? 0) as number
   if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 10000) {
-    return c.json({ error: '"delay_ms" must be an integer between 0 and 10000' }, 400)
+    return c.json({ error: '"delay_ms" must be an integer between 0 and 10000', code: 'invalid_parameter' }, 400)
   }
   const blockAds = body?.block_ads ?? false
-  if (typeof blockAds !== 'boolean') return c.json({ error: '"block_ads" must be a boolean' }, 400)
+  if (typeof blockAds !== 'boolean') return c.json({ error: '"block_ads" must be a boolean', code: 'invalid_parameter' }, 400)
   const removePopups = body?.remove_popups ?? false
-  if (typeof removePopups !== 'boolean') return c.json({ error: '"remove_popups" must be a boolean' }, 400)
+  if (typeof removePopups !== 'boolean') return c.json({ error: '"remove_popups" must be a boolean', code: 'invalid_parameter' }, 400)
   const darkMode = body?.dark_mode ?? false
-  if (typeof darkMode !== 'boolean') return c.json({ error: '"dark_mode" must be a boolean' }, 400)
+  if (typeof darkMode !== 'boolean') return c.json({ error: '"dark_mode" must be a boolean', code: 'invalid_parameter' }, 400)
   const deviceScaleFactor = (body?.device_scale_factor ?? 1) as number
   if (typeof deviceScaleFactor !== 'number' || !Number.isFinite(deviceScaleFactor) || deviceScaleFactor < 1 || deviceScaleFactor > 3) {
-    return c.json({ error: '"device_scale_factor" must be a number between 1 and 3' }, 400)
+    return c.json({ error: '"device_scale_factor" must be a number between 1 and 3', code: 'invalid_parameter' }, 400)
   }
 
   // ai_extract — a plain object of boolean flags, field-count capped (B6). Reject
@@ -1789,15 +1789,15 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   const rawExtract = body?.ai_extract
   if (rawExtract !== undefined && rawExtract !== null) {
     if (typeof rawExtract !== 'object' || Array.isArray(rawExtract)) {
-      return c.json({ error: '"ai_extract" must be an object of boolean flags' }, 400)
+      return c.json({ error: '"ai_extract" must be an object of boolean flags', code: 'invalid_parameter' }, 400)
     }
     const entries = Object.entries(rawExtract as Record<string, unknown>)
     if (entries.length > 20) {
-      return c.json({ error: '"ai_extract" has too many fields (max 20)' }, 400)
+      return c.json({ error: '"ai_extract" has too many fields (max 20)', code: 'invalid_parameter' }, 400)
     }
     for (const [k, v] of entries) {
       if (typeof v !== 'boolean') {
-        return c.json({ error: `"ai_extract.${k}" must be a boolean` }, 400)
+        return c.json({ error: `"ai_extract.${k}" must be a boolean`, code: 'invalid_parameter' }, 400)
       }
     }
     aiExtract = rawExtract as Record<string, boolean>
@@ -1808,7 +1808,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   const aiRequested = !!aiExtract && Object.values(aiExtract).some((v) => v === true)
 
   if (aiRequested && !bedrockClient) {
-    return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
+    return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server', code: 'ai_extraction_unavailable' }, 400)
   }
 
   // ── Effective plan + monthly quota (Supabase; runs AFTER rate limiting) ───────
@@ -1817,11 +1817,11 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   stage.quota = Date.now() - tQuota
   if (!quota.ok) {
     if (quota.kind === 'accounting') {
-      return c.json({ error: 'Usage temporarily unavailable' }, 503) // accounting dependency failed → fail closed
+      return c.json({ error: 'Usage temporarily unavailable', code: 'usage_unavailable' }, 503) // accounting dependency failed → fail closed
     }
     // Capture quota exhausted → hard 429 (unchanged body; frontend branches on quota_type).
     return c.json(
-      { error: 'Monthly capture quota exceeded', quota_type: quota.quotaType, limit: quota.limit, used: quota.used },
+      { error: 'Monthly capture quota exceeded', code: 'capture_quota_exceeded', quota_type: quota.quotaType, limit: quota.limit, used: quota.used },
       429,
     )
   }
@@ -1836,7 +1836,7 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   if (aiRequested && quota.aiExhausted) {
     if (!includeText) {
       return c.json(
-        { error: 'Monthly AI extraction quota exceeded', quota_type: 'ai_extractions', limit: quota.usage.aiLimit, used: quota.usage.aiUsage },
+        { error: 'Monthly AI extraction quota exceeded', code: 'ai_quota_exceeded', quota_type: 'ai_extractions', limit: quota.usage.aiLimit, used: quota.usage.aiUsage },
         429,
       )
     }
@@ -1975,12 +1975,12 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
   const apiKey = authHeader?.match(/^Bearer\s+(.+)$/)?.[1]?.trim()
   if (!apiKey) {
     if (isNotification) return c.body(null, 202)
-    return c.json(rpcError(id, -32001, 'unauthorized'), 200)
+    return c.json(rpcError(id, -32001, 'unauthorized', { code: 'unauthorized' }), 200, { 'X-Shotbase-Error-Code': 'unauthorized' })
   }
   const keyResult = await verifyKey(apiKey)
   if (!keyResult.valid) {
     if (isNotification) return c.body(null, 202)
-    return c.json(rpcError(id, -32001, 'unauthorized'), 200)
+    return c.json(rpcError(id, -32001, 'unauthorized', { code: 'unauthorized' }), 200, { 'X-Shotbase-Error-Code': 'unauthorized' })
   }
 
   switch (method) {
@@ -2001,19 +2001,19 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
     case 'tools/call': {
       const toolName = params?.name
       if (toolName !== 'shotbase_capture') {
-        return c.json(rpcError(id, -32602, `Unknown tool "${String(toolName)}"`), 200)
+        return c.json(rpcError(id, -32602, `Unknown tool "${String(toolName)}"`, { code: 'unknown_tool' }), 200, { 'X-Shotbase-Error-Code': 'unknown_tool' })
       }
       const args = (params?.arguments ?? {}) as Record<string, unknown>
       const url = args.url
       if (typeof url !== 'string' || !url.trim()) {
-        return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Error: "url" is required.' }], isError: true }))
+        return c.json(rpcResult(id, { content: [{ type: 'text', text: 'Error: "url" is required. (code: invalid_url)' }], isError: true }), 200, { 'X-Shotbase-Error-Code': 'invalid_url' })
       }
 
       // Attribution — same rule as /screenshot. Real API keys use their own ownerId
       // (header ignored → no spoofing); a bypass caller must assert a valid user id.
       const owner = resolveOwner(keyResult, c.req.header(INTERNAL_USER_HEADER))
       if (!owner.ok) {
-        return c.json(rpcError(id, -32001, 'unauthorized'), 200)
+        return c.json(rpcError(id, -32001, 'unauthorized', { code: 'unauthorized' }), 200, { 'X-Shotbase-Error-Code': 'unauthorized' })
       }
 
       // Rate limit — BEFORE any Supabase query. Bucket on the resolved user id for
@@ -2023,9 +2023,9 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
       const rlBucket = keyResult.viaBypass ? `user:${owner.ownerId}` : `key:${apiKey}`
       if (await checkRateLimit(rlBucket, rlPlan)) {
         return c.json(rpcResult(id, {
-          content: [{ type: 'text', text: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute.` }],
+          content: [{ type: 'text', text: `Rate limit exceeded. ${rlPlan} plan allows ${getRateLimitPerMinute(rlPlan)} requests/minute. (code: rate_limited)` }],
           isError: true,
-        }))
+        }), 200, { 'X-Shotbase-Error-Code': 'rate_limited' })
       }
 
       // extract=true (default) needs BOTH capture + AI quota; extract=false only capture.
@@ -2037,10 +2037,11 @@ app.post('/api/mcp', mcpBodyLimit, async (c) => {
       // just skip the (exhausted) extraction — the "image + ai_extract" case.
       const quota = await checkMonthlyQuota(keyResult, owner.ownerId, extract)
       if (!quota.ok) {
+        const qCode = quota.kind === 'accounting' ? 'usage_unavailable' : 'capture_quota_exceeded'
         const text = quota.kind === 'accounting'
           ? 'Usage temporarily unavailable'
           : `Monthly capture quota exceeded. ${quota.plan} plan allows ${quota.limit} captures/month (used ${quota.used}).`
-        return c.json(rpcResult(id, { content: [{ type: 'text', text }], isError: true }))
+        return c.json(rpcResult(id, { content: [{ type: 'text', text: `${text} (code: ${qCode})` }], isError: true }), 200, { 'X-Shotbase-Error-Code': qCode })
       }
       const mcpAiSkipped = extract && quota.aiExhausted // capture OK, AI budget spent → skip AI, still serve image
 
