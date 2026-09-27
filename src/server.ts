@@ -1368,13 +1368,6 @@ function quotaHeaders(u: QuotaUsage): Record<string, string> {
   return h
 }
 
-// Next monthly reset as a unix epoch (start of next UTC month). Mirrors
-// startOfMonthUtcIso's boundary; used by GET /quota so callers know when caps roll.
-function monthlyResetEpoch(): number {
-  const n = new Date()
-  return Math.floor(Date.UTC(n.getUTCFullYear(), n.getUTCMonth() + 1, 1) / 1000)
-}
-
 // Read-only quota snapshot for GET /quota: resolves the real plan and reads BOTH
 // monthly counts (captures + AI) WITHOUT enforcing anything or spending a capture.
 // Unlike checkMonthlyQuota it never 429s and always reads the AI count. Fail closed:
