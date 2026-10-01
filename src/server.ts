@@ -1,3 +1,6 @@
+// Shotbase — AI-Native Screenshot API
+// Copyright 2026 Manish Gudimetla. Licensed under AGPL-3.0. See LICENSE.
+
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
