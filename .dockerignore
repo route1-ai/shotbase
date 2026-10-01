@@ -1,0 +1,29 @@
+# Never bake secrets into the image
+.env
+.env.*
+!.env.example
+
+# Dev and tooling noise
+node_modules
+dist
+bench/
+.claude/
+*.log
+
+# Internal docs
+CLAUDE.md
+HANDOVER.md
+AGENTS.md
+BACKLOG.md
+PRD.md
+SKILLS.md
+SPEC_MCP_SERVER.md
+SHOTBASE_BUILD_PLAN.md
+LEARNINGS.md
+TASK.md
+
+# Test artifacts
+test/*.png
+test/*.jpeg
+*.png
+*.jpeg
