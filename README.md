@@ -52,7 +52,34 @@ curl -X POST http://localhost:3000/screenshot \
 - No user accounts or API key dashboard
 - No billing or usage quotas
 - No usage dashboard
-- AI extraction (`ai_extract`) requires your own AWS Bedrock credentials in `.env`
+- AI extraction (`ai_extract`) needs your own model provider — see below. Screenshots
+  work without it; `ai_extract` requests return 400 with an explanation.
+
+### AI extraction on your own key
+
+`ai_extract` works with any OpenAI-compatible `/chat/completions` endpoint. Set three
+values in `.env`:
+
+```bash
+AI_BASE_URL=https://api.groq.com/openai/v1
+AI_API_KEY=your_key
+AI_MODEL=openai/gpt-oss-120b
+```
+
+Verified working: **Groq**, **OpenAI** (`https://api.openai.com/v1`), **OpenRouter**
+(`https://openrouter.ai/api/v1`), **DeepSeek**, **Together**. AWS Bedrock is also
+supported via `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+
+**Fully local, nothing leaves your machine** — point it at Ollama:
+
+```bash
+AI_BASE_URL=http://host.docker.internal:11434/v1
+AI_MODEL=llama3.2
+# no AI_API_KEY needed
+```
+
+Reasoning models (gpt-oss, qwen3) bill their thinking against the reply budget. If
+extraction returns empty, raise `AI_MAX_TOKENS` (default 4096).
 
 For the full field reference, see [The API](#the-api) below.
 
@@ -101,7 +128,8 @@ extracted JSON in a single call.
 
 ### `GET /health`
 
-Returns `{ "status": "ok" }` plus uptime, browser status, and cache stats.
+Returns `{ "status": "ok", "service": "shotbase" }` with HTTP 200, or `"degraded"` with
+HTTP 503 when the browser pool is unhealthy. Useful as a container healthcheck.
 
 ### MCP tool — `shotbase_capture`
 
