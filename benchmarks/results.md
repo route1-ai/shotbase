@@ -21,10 +21,11 @@ byte of the response body** — not any provider-reported render time.
 **Target pages:** example.com (static), stripe.com (marketing), news.ycombinator.com
 (text-heavy), linear.app (JS app)
 
-**Providers attempted:** shotbase, screenshotone, apiflash, capturekit, urlbox, and one
-additional. Three of six competitor API keys failed during the run (capturekit returned
-403 Forbidden on preflight and was excluded; others were not configured or expired), so
-the comparison is incomplete and covers only three providers.
+**Providers attempted:** shotbase, screenshotone, apiflash, capturekit, urlbox.
+Three providers completed the run (shotbase, screenshotone, apiflash). capturekit
+returned 403 Forbidden on preflight and was excluded. urlbox was not configured — no
+key was supplied, so it was skipped rather than tested. The comparison therefore covers
+three providers, not the field.
 
 ---
 
@@ -106,9 +107,9 @@ screenshotone had a single very slow marketing run (10 632ms) in an otherwise 4�
 - **Raw speed rankings are not stable.** With 3 runs from one machine in one location,
   a margin of a few hundred milliseconds is within network noise. Do not cite these
   numbers as definitive speed claims.
-- **Three competitors are missing.** capturekit returned 403 and was excluded; two
-  other keys were not configured or expired at run time. A full comparison would
-  require all providers working.
+- **Most of the field is missing.** Only two competitors were actually measured.
+  capturekit returned 403 and was excluded; urlbox was never configured. This is a
+  three-provider snapshot, not a market comparison.
 - **Cold vs. warm cache not isolated.** The Shotbase instance was running and had
   served prior requests before this benchmark; we did not instrument cache state
   per provider.

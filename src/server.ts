@@ -44,7 +44,12 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.warn('Supabase env vars missing — usage/logs will not be recorded')
 }
 
-// ─── AWS Bedrock ──────────────────────────────────────────────────────────────
+// ─── AI extraction provider ───────────────────────────────────────────────────
+// Two backends. Bedrock is what the hosted service runs. Any OpenAI-compatible
+// chat-completions endpoint covers everything else a self-hoster is likely to have:
+// OpenAI, Groq, OpenRouter, DeepSeek, Together, or a fully local Ollama / vLLM.
+// Precedence: an explicit AI_API_KEY + AI_BASE_URL wins; otherwise AWS creds pick
+// Bedrock; with neither set, ai_extract is unavailable and says so.
 let bedrockClient: BedrockRuntimeClient | null = null
 if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
   bedrockClient = new BedrockRuntimeClient({
@@ -55,6 +60,27 @@ if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
     },
   })
   console.log('✓ AWS Bedrock connected')
+}
+
+// An OpenAI-compatible endpoint. base_url is required (so a key alone can't silently
+// aim at someone else's API); model defaults to a small, cheap, widely-present one.
+const AI_BASE_URL = (process.env.AI_BASE_URL ?? '').replace(/\/+$/, '')
+const AI_API_KEY = process.env.AI_API_KEY ?? ''
+const AI_MODEL = process.env.AI_MODEL ?? 'gpt-4o-mini'
+// Reasoning models (gpt-oss, qwen3, o-series) bill their thinking against this same
+// budget, so 1024 can be consumed before any answer is emitted. 4096 leaves headroom;
+// override downward to cut cost on a non-reasoning model.
+const AI_MAX_TOKENS = Number(process.env.AI_MAX_TOKENS ?? 4096)
+// A local endpoint (Ollama, vLLM, LM Studio) legitimately needs no key.
+const openAiCompatible = AI_BASE_URL.length > 0 ? { baseUrl: AI_BASE_URL, apiKey: AI_API_KEY, model: AI_MODEL } : null
+if (openAiCompatible) {
+  console.log(`\u2713 AI extraction via OpenAI-compatible endpoint (${AI_BASE_URL}, model ${AI_MODEL})`)
+}
+
+// Is structured extraction available at all? Checked before any capture work so the
+// caller gets a 400 instead of paying for a render that can't produce intelligence.
+function aiExtractionAvailable(): boolean {
+  return !!openAiCompatible || !!bedrockClient
 }
 
 // ─── Persistent Browser ───────────────────────────────────────────────────────
@@ -905,30 +931,95 @@ export const REMOVE_POPUPS_SCRIPT = (): number => {
 // Bedrock structured extraction — extracted so it can start early and run in parallel
 // with the screenshot. Returns aiData on success, aiError on failure (graceful), and
 // the pure model-call duration. The raw provider error is logged server-side only.
+// One prompt, shared by both backends, so self-hosted and hosted return the same
+// shape. Page text is truncated to bound cost and latency on very long pages.
+function buildExtractionPrompt(aiExtract: Record<string, boolean>, pageText: string): string {
+  const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
+  return `Extract structured data from this webpage. Return ONLY valid JSON with requested fields.\n- page_type: one of [pricing, docs, blog, landing, product, other]\n- prices: array of price strings\n- headings: array of main headings\n- ctas: array of CTA button texts\nNo explanation. Just JSON.\n\nPage content:\n${pageText.slice(0, 8000)}\n\nRequested fields: ${JSON.stringify(fields)}`
+}
+
+// Models wrap JSON in markdown fences often enough that stripping them is not
+// optional. Unparseable output is returned under `raw` rather than thrown away —
+// the caller still gets the capture, and a bad model is visible instead of silent.
+function parseExtractionOutput(result: string): Record<string, unknown> {
+  const cleaned = result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+  try { return JSON.parse(cleaned) } catch { return { raw: result } }
+}
+
+// Any OpenAI-compatible /chat/completions endpoint. A local endpoint needs no key,
+// so Authorization is sent only when one is configured.
+async function extractViaOpenAiCompatible(
+  cfg: { baseUrl: string; apiKey: string; model: string },
+  prompt: string,
+): Promise<string | undefined> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`
+
+  // Bound the call so a hung provider can't hold a browser permit open indefinitely.
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 30_000)
+  try {
+    const res = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: AI_MAX_TOKENS,
+        temperature: 0,
+      }),
+      signal: ctl.signal,
+    })
+    if (!res.ok) {
+      // Provider error text can carry the key back in an echoed request; don't log it.
+      throw new Error(`AI provider returned ${res.status}`)
+    }
+    const body = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>
+    }
+    const choice = body.choices?.[0]
+    const content = choice?.message?.content
+    // Reasoning models spend part of max_tokens thinking. If the budget ran out
+    // before any answer was emitted, content is empty and finish_reason says why —
+    // report that instead of returning silently with no data and no error.
+    if (!content && choice?.finish_reason === 'length') {
+      throw new Error('AI provider hit the token limit before returning an answer — raise AI_MAX_TOKENS or use a smaller model')
+    }
+    return content
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function extractViaBedrock(prompt: string): Promise<string | undefined> {
+  const response = await bedrockClient!.send(
+    new ConverseCommand({
+      modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+      messages: [{ role: 'user', content: [{ text: prompt }] }],
+      inferenceConfig: { maxTokens: 1024, temperature: 0 },
+    }),
+  )
+  return response.output?.message?.content?.[0]?.text
+}
+
 async function runBedrockExtraction(
   aiExtract: Record<string, boolean>,
   pageText: string,
 ): Promise<{ aiData?: Record<string, unknown>; aiError?: string; ms: number }> {
   const t0 = Date.now()
   try {
-    const fields = Object.keys(aiExtract).filter((k) => aiExtract[k])
-    const prompt = `Extract structured data from this webpage. Return ONLY valid JSON with requested fields.\n- page_type: one of [pricing, docs, blog, landing, product, other]\n- prices: array of price strings\n- headings: array of main headings\n- ctas: array of CTA button texts\nNo explanation. Just JSON.\n\nPage content:\n${pageText.slice(0, 8000)}\n\nRequested fields: ${JSON.stringify(fields)}`
-    const response = await bedrockClient!.send(
-      new ConverseCommand({
-        modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-        messages: [{ role: 'user', content: [{ text: prompt }] }],
-        inferenceConfig: { maxTokens: 1024, temperature: 0 },
-      }),
-    )
-    const result = response.output?.message?.content?.[0]?.text
-    if (result) {
-      try { return { aiData: JSON.parse(result.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()), ms: Date.now() - t0 } }
-      catch { return { aiData: { raw: result }, ms: Date.now() - t0 } }
-    }
-    return { ms: Date.now() - t0 }
+    const prompt = buildExtractionPrompt(aiExtract, pageText)
+    // Explicit endpoint wins over Bedrock: an operator who set AI_BASE_URL meant it.
+    const result = openAiCompatible
+      ? await extractViaOpenAiCompatible(openAiCompatible, prompt)
+      : await extractViaBedrock(prompt)
+    if (result) return { aiData: parseExtractionOutput(result), ms: Date.now() - t0 }
+    // Succeeded but said nothing. Never return silently — a self-hoster debugging a
+    // model choice needs to see this, not an unexplained null.
+    return { aiError: 'AI provider returned an empty response', ms: Date.now() - t0 }
   } catch (err) {
     const aiError = err instanceof Error ? err.message : 'Unknown error'
-    console.error('Bedrock error:', aiError)
+    console.error('AI extraction error:', aiError)
     return { aiError, ms: Date.now() - t0 }
   }
 }
@@ -1223,7 +1314,7 @@ async function performCapture(opts: CaptureOpts): Promise<CaptureResult> {
 
     // Start Bedrock the moment text is available so it overlaps the screenshot; await
     // it after. In data mode there is no screenshot to overlap (Bedrock runs alone).
-    const doBedrock = aiRequested && !skipAi && !!aiExtract && !!bedrockClient && !!pageText
+    const doBedrock = aiRequested && !skipAi && !!aiExtract && aiExtractionAvailable() && !!pageText
     const bedrockPromise = doBedrock
       ? runBedrockExtraction(aiExtract as Record<string, boolean>, pageText as string)
       : Promise.resolve<{ aiData?: Record<string, unknown>; aiError?: string; ms: number }>({ ms: 0 })
@@ -1810,8 +1901,12 @@ app.post('/screenshot', screenshotBodyLimit, async (c) => {
   // is NOT (→ no Bedrock, no AI quota — treated like a plain capture).
   const aiRequested = !!aiExtract && Object.values(aiExtract).some((v) => v === true)
 
-  if (aiRequested && !bedrockClient) {
-    return c.json({ error: 'AI extraction requires AWS Bedrock credentials on the server' }, 400)
+  if (aiRequested && !aiExtractionAvailable()) {
+    return c.json({
+      error: 'AI extraction is not configured on this server. Set AI_BASE_URL + AI_API_KEY ' +
+             'for any OpenAI-compatible provider (OpenAI, Groq, OpenRouter, or a local Ollama), ' +
+             'or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY for Bedrock. See docs/SELF_HOSTING.md.',
+    }, 400)
   }
 
   // ── Effective plan + monthly quota (Supabase; runs AFTER rate limiting) ───────
