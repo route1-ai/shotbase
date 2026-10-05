@@ -6,6 +6,44 @@ sees the page the way a person does, not just a blob of pixels.
 
 ---
 
+## Why this exists
+
+Every commercial screenshot API is hosted-only. You send them a URL, their
+servers load the page, their model reads the text, and you get a result back.
+For most pages that is completely fine.
+
+It stops working the moment the page isn't public. An internal dashboard, a
+staging environment, a customer's invoice behind a login, anything on a VPN —
+either the service cannot reach it, or reaching it means your page content and
+your customer's data pass through someone else's infrastructure and someone
+else's model.
+
+There are good MCP screenshot servers now. They all point at a vendor's cloud.
+There isn't one you can run yourself.
+
+So three things here are different:
+
+- **You can run the whole thing.** `docker compose up`. No account, no key
+  service, no billing, no telemetry back to us.
+- **AI extraction uses your model, not ours.** Point it at OpenAI, Groq,
+  OpenRouter — or at Ollama on localhost, in which case the page text never
+  leaves the machine that rendered it.
+- **The MCP server is yours too.** Your agent talks to your instance. Nothing
+  about the pages your agent looks at reaches a third party.
+
+And because it's AGPL, you don't have to take our word on any of it. The SSRF
+guard, the cache isolation, the way provider errors are handled — read it. With
+a closed service you get a trust page; here you get the function. See
+[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+
+**If none of that is your problem, don't self-host.** If you just want
+screenshots and you'd rather not run Chromium in production, use
+[shotbase.dev](https://shotbase.dev) — same code, managed, with accounts and
+billing handled. Running infrastructure is a real cost and it isn't worth paying
+unless you need what it buys.
+
+---
+
 ## Two ways to run it
 
 | | Self-host | Hosted (shotbase.dev) |
