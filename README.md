@@ -151,6 +151,25 @@ same license. For a commercial license without the copyleft obligation, contact 
 
 ---
 
+## Security
+
+A screenshot API fetches arbitrary URLs from inside your network, which makes
+SSRF the primary threat rather than an edge case. Shotbase blocks private and
+reserved address space (including `169.254.169.254`, the cloud metadata endpoint
+that serves instance IAM credentials), resolves hostnames and checks every
+returned address against DNS rebinding, rejects non-HTTP schemes and embedded
+credentials, and keeps authenticated renders out of the shared cache.
+
+Auth fails closed — there are no default or hardcoded keys anywhere in the
+codebase.
+
+Full detail, including what self-hosting makes your responsibility and what has
+*not* been audited: **[docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md)**.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local dev setup, test instructions, and PR guidelines.
