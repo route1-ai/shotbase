@@ -17,7 +17,7 @@ Most clients need only this — no manual header flags:
     "shotbase": {
       "command": "npx",
       "args": ["-y", "@shotbase/mcp"],
-      "env": { "SHOTBASE_API_KEY": "sk_your_key_here" }
+      "env": { "SHOTBASE_API_KEY": "YOUR_KEY" }
     }
   }
 }
@@ -27,7 +27,7 @@ Most clients need only this — no manual header flags:
 - **Cursor** → `.cursor/mcp.json`
 - **Zed** → `settings.json` under `context_servers`
 
-You can also pass the key as an argument instead of the env var: `"args": ["-y", "@shotbase/mcp", "--key", "sk_your_key_here"]`.
+You can also pass the key as an argument instead of the env var: `"args": ["-y", "@shotbase/mcp", "--key", "YOUR_KEY"]`.
 
 ## The tool
 

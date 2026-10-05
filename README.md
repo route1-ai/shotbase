@@ -66,7 +66,7 @@ git clone https://github.com/route1-ai/shotbase.git
 cd shotbase
 cp .env.example .env
 # Edit .env — set API_KEYS to any string you want, e.g.:
-#   API_KEYS=sk_mysecretkey
+#   API_KEYS=YOUR_KEY
 docker compose up
 ```
 
@@ -80,7 +80,7 @@ Take a screenshot:
 
 ```bash
 curl -X POST http://localhost:3000/screenshot \
-  -H "Authorization: Bearer sk_mysecretkey" \
+  -H "Authorization: Bearer YOUR_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "url": "https://example.com", "format": "png" }'
 ```
@@ -130,13 +130,13 @@ Claude Desktop, Cursor, or any MCP client:
 
 ```bash
 claude mcp add --transport http shotbase https://api.shotbase.dev/api/mcp \
-  --header "Authorization: Bearer sk_your_shotbase_key"
+  --header "Authorization: Bearer YOUR_KEY"
 ```
 
 > The server URL must come right after the name; `--header` goes last (it's variadic).
 
 1. **Get your key** → https://shotbase.dev/dashboard/keys
-2. **Run the command above** (paste your key in place of `sk_your_shotbase_key`)
+2. **Run the command above** (paste your key in place of `YOUR_KEY`)
 3. **Ask your agent** → *"Screenshot stripe.com/pricing and tell me the tiers."*
 
 Your agent now has one tool, `shotbase_capture`, that returns the screenshot **and** the
