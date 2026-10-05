@@ -1,7 +1,7 @@
 {
-  "name": "@shotbase/mcp",
+  "name": "shotbase-mcp",
   "version": "0.1.0",
-  "description": "Shotbase MCP server — capture any web page plus structured intelligence (page type, headings, CTAs, prices) in one call. Thin stdio bridge to the hosted Shotbase MCP endpoint.",
+  "description": "MCP server for Shotbase \u2014 capture any web page plus structured data (page type, headings, CTAs, prices) in one call. Point it at your own self-hosted instance via SHOTBASE_MCP_URL, or at the hosted API.",
   "type": "module",
   "bin": {
     "shotbase-mcp": "index.mjs"
@@ -19,7 +19,10 @@
     "screenshot",
     "shotbase",
     "claude",
-    "agents"
+    "agents",
+    "self-hosted",
+    "screenshot-api",
+    "playwright"
   ],
   "license": "MIT",
   "homepage": "https://shotbase.dev",

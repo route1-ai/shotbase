@@ -9,7 +9,7 @@
 // Why this exists: stdio-only clients (Claude Desktop, Zed) can't send a custom
 // Authorization header for a remote HTTP MCP server, and the generic `mcp-remote --header`
 // bridge is fragile (its header flag splits on spaces). Here the key comes from an env
-// var, so `npx -y @shotbase/mcp` is one clean, unbreakable line.
+// var, so `npx -y shotbase-mcp` is one clean, unbreakable line.
 //
 // Config: SHOTBASE_API_KEY (required; or --key <key>). SHOTBASE_MCP_URL optional
 // (default https://api.shotbase.dev/api/mcp).
