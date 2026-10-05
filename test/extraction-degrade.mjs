@@ -50,7 +50,7 @@ async function withServer(env, fn) {
   } finally { try { child.kill('SIGKILL') } catch {} await sleep(300) }
 }
 
-const INVALID_AWS = { AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'AKIAINVALIDTESTKEY000', AWS_SECRET_ACCESS_KEY: 'invalidsecret0000000000000000000000000000' }
+const INVALID_AWS = { AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'not-a-real-access-key', AWS_SECRET_ACCESS_KEY: 'not-a-real-secret-value' }
 const BASE_ENV = { PLAYGROUND_BYPASS_KEY: BYPASS, UNKEY_ROOT_KEY: '' }
 
 // ── Case 1: extraction success (real creds; skips if gated) ──────────────────

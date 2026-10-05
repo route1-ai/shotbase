@@ -44,7 +44,7 @@ const child = spawn('node', ['dist/server.js'], {
   env: {
     ...process.env, PORT: String(PORT), API_KEYS: KEY, UNKEY_ROOT_KEY: '', PLAYGROUND_BYPASS_KEY: '',
     SUPABASE_URL: `http://127.0.0.1:${mockPort}`, SUPABASE_SERVICE_ROLE_KEY: 'test', REDIS_URL: '',
-    AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'AKIAINVALIDTESTKEY000', AWS_SECRET_ACCESS_KEY: 'invalidsecret0000000000000000000000000000',
+    AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'not-a-real-access-key', AWS_SECRET_ACCESS_KEY: 'not-a-real-secret-value',
   },
   stdio: ['ignore', 'ignore', 'inherit'],
 })

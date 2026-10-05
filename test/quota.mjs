@@ -65,7 +65,7 @@ const mock = http.createServer((req, res) => {
 await new Promise((r) => mock.listen(0, '127.0.0.1', r))
 const mockPort = mock.address().port
 
-const AWS_INVALID = { AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'AKIAINVALIDTESTKEY000', AWS_SECRET_ACCESS_KEY: 'invalidsecret0000000000000000000000000000' }
+const AWS_INVALID = { AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'not-a-real-access-key', AWS_SECRET_ACCESS_KEY: 'not-a-real-secret-value' }
 
 // Server WITH Supabase (quota enforced)
 const child = spawn('node', ['dist/server.js'], {
